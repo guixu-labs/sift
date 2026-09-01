@@ -444,9 +444,10 @@ sift audit path/to/skill/ --db opencode.db
 
 ## sift-records v2：文件归因证据
 
-Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 导出为一个结构化 JSON，再直接作为 `--transcript` 输入。当前实现提供 v2 reader、blob 校验、capture 归一化和 `SessionDigest` 证据保存；现有 Judge、`AuditFinding` 和 audit 报告尚未将文件 effect 作为新的判定维度。顶层 `format` 仍是 `sift-records`，因此旧 reader 可以识别；`version: 2` 启用文件证据校验和 lineage 透传。
+Opsbot 可以将完整 session 事件与文件归因 capture 导出为一个结构化 JSON，直接作为 `--transcript` 输入。当前实现内部证据模型：
 
-### 顶层字段
+### 内部证据模型
+#### 输入 Json 字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -461,7 +462,7 @@ Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 
 | `coverage` | object | producer 已知的证据覆盖情况 |
 | `warnings` | array | producer 或 reader 需要人工关注的缺口 |
 
-### capture、effect 和 blob 规则
+#### capture、effect 和 blob 规则
 
 - `records[].tool_calls[]` 可以携带原生 `id`、`timestamp`、`result`、`is_error` 和 `capture_id`。Sift 会保留这些信息，不为 v2 工具调用重建虚假的关联 ID。
 - `captures[capture_id]` 保存 actor、agent、runtime/model、工具生命周期、父子 session lineage 和 `effects`。即使没有 mutation，capture 也必须保留，表示工具执行过但没有产生文件变化。
@@ -480,7 +481,7 @@ Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 
 
 一个 capture 被多个 tool call 引用时，或 capture 自身为 `ambiguous`，reader 会将其关联质量标记为 `ambiguous`。完全没有 tool call 引用的 capture 标记为 `unmatched`，仍会写入 canonical record 的 `_sift_standalone_capture` 字段，供 loose/root/agent 审计查看；Skill 切片不会把它归给附近的 Skill 调用。
 
-### 进入 audit 的中间格式
+#### 进入 audit 的中间格式
 
 CLI 检测到 `sift-records` JSON 后，调用 `load_structured_records()` 将它展开为临时 canonical JSONL，再交给既有 `slice_transcript()`、`_digest_from_records()` 和 `TranscriptAuditor`。因此：
 
@@ -488,76 +489,6 @@ CLI 检测到 `sift-records` JSON 后，调用 `load_structured_records()` 将�
 - `_sift_bundle_meta` 只附在第一个 canonical record 上，切片时复制到每个 segment 的第一条记录；
 - 关联 capture 放在工具块的 `_sift_evidence`，standalone capture 放在 `_sift_standalone_capture`；
 - `SessionDigest` 保存 `evidence_refs`、`evidence_warnings`、`evidence_metadata` 和 `provenance_timeline`，同时继续填充原有 `tool_trace`、`input_files`、`produced_files`。
-
-```bash
-sift audit path/to/agent.md \
-  --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
-```
-
-`--kind`、多 transcript 聚合、coverage、boundary 和现有报告参数均保持不变。当前文件归因只是 digest 层的辅助证据，可供后续 FILE_EFFECT/Judge/report 功能使用；它尚未自动支撑“谁修改了哪个路径、最终可信状态由哪次 capture 产生”等 audit verdict，也不会把“未声明工具”自动判成违规。
-
-### 完整设计与后续 PR 契约
-
-#### 分阶段边界
-
-| 阶段 | 代码位置 | 目标 |
-|---|---|---|
-| Sift evidence foundation | `evals/structured.py`、`evals/transcript.py`、`models/` | 接收 v2、校验 blob、保留 lineage/effect、形成 digest timeline |
-| Opsbot exporter | Opsbot provenance plugin/Host service/API/UI | 从单 session 导出可审计证据原件 |
-| Sift audit integration | `audit/`、reporting、Judge prompt | 将可信文件 effect 注入 scene、判定和报告 |
-
-后续实现必须继续复用 `sift audit`、Markdown instruction extractor 和现有四类 Judge；不新增 `workflow.audit.yaml`、独立 trajectory 命令或第二套结构化规则。
-
-#### Opsbot 导出契约
-
-Opsbot 导出一个 session 的完整事件和文件归因证据：
-
-```text
-GET /api/provenance/sessions/{session_id}/audit-evidence?project_dir=...
-```
-
-接口返回 JSON attachment，并设置 `Cache-Control: no-store`。权限和失败语义固定为：未知项目 `403`、未知 session `404`、file provenance 插件禁用 `503`、证据 blob 损坏则拒绝导出且不生成部分包。Session Detail 的“文件归因”页签提供同一下载动作。
-
-主轨迹只导出用户/助手消息、工具调用与结果、iteration、subagent lifecycle 和错误；内部日志及重复的 file lifecycle 原始事件不重复导出。主轨迹按 timestamp 排序，同时间按 event/capture ID 稳定排序，并保留 agent、native session、parent session 和 parent tool-use lineage。
-
-capture 使用 `capture_id` 或唯一 `tool_use_id` 关联。无法唯一关联的 capture 必须独立保留并标记 `ambiguous`/`unmatched`，不得静默丢弃。没有 mutation 的 capture 也必须保留，以证明工具执行过但没有文件变化。
-
-#### 文件效果和可信度契约
-
-每个 effect 至少包含 `path`，并可包含 before/after blob、additions、deletions 和 conflict。`blobs` 只保存 mutation 涉及文件的完整 before/after 字节，按 SHA-256 去重；文本用 UTF-8，二进制用 base64，不导出整个 worktree。
-
-第二阶段重建文件状态时必须遵守：
-
-1. 仅 `quality=observed` 的 effect 可以覆盖可信状态；
-2. `incomplete`、`conflicted`、`ambiguous` 不覆盖可信状态，进入 `unreconstructed`/warnings；
-3. 同一路径由最后一个可信 capture 决定最终状态；
-4. PASS/FAIL 若只引用非可信 capture，自动降级为 `INDETERMINATE`；
-5. 每条文件事实使用稳定引用 `capture:<capture_id>:<path>`。
-
-#### Sift 审计集成契约
-
-后续 PR 在现有 transcript scene 中加入标准化 `[FILE_EFFECT]` 块，至少包含 actor、tool status、path、additions/deletions、quality 和 evidence ref。发送给 Judge 的内容只使用 token 预算内的 unified diff/excerpt；二进制只提供 hash、size 和 path，完整快照仍留在输入证据包。
-
-Judge prompt 必须明确：`observed` 可支持文件事实，其他 quality 只能支持 `INDETERMINATE`；引用文件事实时必须返回 evidence refs。`AuditFinding` 增加向后兼容的 `evidence_refs`，并过滤不存在的引用。报告新增输入证据 SHA-256、Opsbot session ID 和 coverage warnings，同时展示 capture、path、quality 和有限 diff，不嵌入完整快照。
-
-这些证据可以新增路径边界、角色边界、工具声称与实际 effect 一致性、代码变更后的测试/文档补齐、用户修改冲突和最终文件归因等审计维度；“未声明工具”仍只是 boundary 信息，不自动构成违规。
-
-#### 端到端示例
-
-```bash
-# 1. 在 Opsbot UI 下载 opsbot-audit-<session>.json
-# 2. 使用 agent 声明审计对应子 agent 作用域
-sift audit path/to/agent.md \
-  --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
-
-# 3. 查看机器报告和人读报告
-cat audit-output/audit-report.json
-open audit-output/audit-report.html
-```
-
-第一阶段运行上述命令时，v2 包会被正确读取并进入 digest，但文件 effect 尚未改变 verdict；第二阶段完成后，报告才会出现 `[FILE_EFFECT]`、evidence refs 和可信文件状态判定。
 
 ### `trigger` — 触发准确度（第 4 维）
 

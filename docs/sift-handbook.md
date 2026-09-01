@@ -1848,113 +1848,119 @@ audit 不 re-run cc、只对账已有 transcript，所以「transcript 从哪来
 
 ---
 
-### 13.10 文件归因证据：Sift 侧证据层基础能力
+### 13.10 文件归因证据审计
 
-当前 PR 只把 Opsbot 文件归因证据接入 Sift 的 reader 和 `SessionDigest`，尚未把它升级为新的审计判定维度。也就是说，Sift 现在可以保存“哪个 agent 的哪次工具调用可能改变了哪个文件”，但现有 Judge、`AuditFinding` 和报告仍只按既有 transcript/tool trace 生成 verdict。
+Opsbot 负责将文件归因证据输出为对应的 JSON 文件，Sift 侧负责导入和审计；Sift 的既有 Markdown 指令抽取、四类 Judge、coverage、boundary 和报告体系不变。
 
-```bash
-# 可用于验证 v2 输入能被 reader/digest 接收；当前不会改变文件审计 verdict
-sift audit path/to/agent.md \
-  --transcript opsbot-audit-<session>.json \
-  --kind agent -o audit-output
-```
+设计按证据层、确定性行为分析和语义审计分阶段交付：
 
-处理链路如下：
-
-1. reader 校验顶层版本、capture 引用和每个 blob 的 SHA-256/size；任一引用损坏，整个输入失败，不生成部分可信包。
-2. reader 把每个 turn 展开成现有 canonical record。工具块保留原生 tool ID、`capture_id`、agent/session lineage；无法唯一关联的 capture 作为 standalone evidence 保留，不伪造 tool call。
-3. digest 从 `observed` capture 建立 `capture:<capture_id>:<path>` evidence ref 和文件效果；按时间、event ID、capture ID 稳定排序形成 provenance timeline。
-4. `incomplete`、`conflicted`、`ambiguous` effect 不覆盖可信文件状态，但会进入 `unreconstructed` 和 warnings。这样“文件发生过变化”和“这次变化可以确定归因”是两个独立结论。
-5. 现有 Judge 继续负责 Markdown 指令遵循性；本 PR 尚未将文件 effect 渲染进 Judge scene，也不会把“未声明的工具”自动判成违规。
-
-质量状态的含义：
-
-| quality | 可否作为确定性文件事实 | 典型原因 |
+| 阶段 | 交付内容 | 当前状态 |
 |---|---|---|
-| `observed` | 可以 | capture 完整、无冲突、关联唯一 |
-| `incomplete` | 不可以 | 生命周期或 before/after 证据缺失 |
-| `conflicted` | 不可以 | 重叠 mutation、冲突或跨 commit |
-| `ambiguous` | 不可以 | capture 无法唯一关联到 tool call |
+| 1. 内部证据模型 | v2 reader、blob 校验、capture/effect 归一化、lineage 透传、digest timeline | 当前 PR |
+| 2. 确定性 Analyzer | evidence health、attribution integrity、file churn、actor ownership、verification closure | 后续 PR |
+| 3. 独立 Finding | `ProvenanceFinding` / `ProvenanceAuditResult` 与 `AuditFinding` 分离 | 后续 PR |
+| 4. audit 使用 | v2 自动运行 analyzer；v1/session 保持原行为 | 后续 PR |
+| 5. 报告展示 | Provenance Overview、Behavior Findings、File Timeline | 后续 PR |
+| 6. 语义审计 | 受限 LLM 检查最终回答、变更完整性和替代路径 | 单独评估（TODO） |
 
-未来接入判定层后，文件归因可以支持：限制修改目录、检查代码变更后是否补测试、识别禁止修改的生成文件、判断子 agent 是否写文件、核对工具结果与真实文件 effect，以及追踪某路径最后一个可信 capture。当前这些问题不会自动出现在 audit verdict 中；它们仍需读取 `SessionDigest` 的证据字段或等待后续 FILE_EFFECT/Judge/report 接入。
+#### 内部证据模型
 
-v2 包的完整快照只包含发生 mutation 的文件，不是整个 worktree。报告记录输入证据 SHA-256、session ID、capture/path/quality 和有限 diff，不重复嵌入完整快照。
+把 Opsbot 提供的文件归因证据（`sift-records` v2）带入现有审计流程，内部模型分成三层：
 
-#### 完整设计：证据原件、中间层和判定层分离
+| 模型 | 作用 | 关键内容 |
+|---|---|---|
+| `ToolCallRecord` | 现有工具轨迹的扩展 | 原生 tool ID、工具输入/结果、状态、时间、capture ID、agent/session lineage、evidence refs |
+| `FileEffectRecord` | 单个文件 effect | path、before/after blob、增删统计、quality、conflict、actor、工具和有限内容 |
+| `ProvenanceEvent` | capture 级时间线事件 | capture/tool 关联、actor/agent、生命周期、runtime/model、git head、effects 和稳定 sequence |
 
-文件归因的设计目标不是替换 transcript，而是让“工具声称做了什么”和“文件实际上发生了什么”可以在同一条证据链中交叉验证。证据原件由 Opsbot 负责，Sift 只消费协议化 JSON；Sift 的既有 Markdown 指令抽取、四类 Judge、coverage、boundary 和报告体系继续作为唯一审计入口。
+#### 关键步骤
 
-设计分为两个交付阶段：
-
-| 阶段 | 负责仓库 | 交付内容 | 当前状态 |
-|---|---|---|---|
-| 第一阶段 | Sift | v2 reader、blob 校验、capture/effect 归一化、lineage 透传、digest timeline | 当前 PR |
-| 第二阶段 | Opsbot + Sift | Opsbot 导出 API/UI、`[FILE_EFFECT]` scene、可信文件重建、Judge evidence refs、报告展示 | 后续 PR |
-
-第一阶段先稳定证据协议，避免在 exporter、reader、Judge 三处同时猜测 session 语义。第二阶段才把文件 effect 变成可见的审计证据和新审计维度；两阶段都不引入 workflow DSL 或硬门禁。
-
-完整链路：
-
-```text
-Opsbot session events + ProvenanceStore
-        │
-        ├─ 主轨迹：user/assistant、tool call/result、iteration、subagent lifecycle、error
-        └─ 归因证据：capture、mutation、conflict、before/after blob
-        │
-        ▼
-sift-records v2 JSON（证据原件）
-        │  版本 / 引用 / SHA-256 校验
-        ▼
-canonical JSONL（现有 cc-record 形）
-        │  slice_transcript（root/skill/agent）
-        ▼
-SessionDigest
-  ├─ 原有 tool_trace / transcript_text / input_files / produced_files
-  ├─ evidence_refs: capture:<capture_id>:<path>
-  └─ provenance_timeline（稳定时间顺序）
-        │
-        ▼
-第二阶段：标准化 [FILE_EFFECT] scene → 现有 Judge
-        │
-        ▼
-audit-report（verdict + evidence refs + 有限 diff）
-```
-
-第二阶段的判定口径：`observed` capture 才能支持文件事实；`incomplete`、`conflicted`、`ambiguous` 只能导致 `INDETERMINATE` 或 warning，不能覆盖可信文件状态。若 PASS/FAIL 只引用非可信 capture，结果必须降级为 `INDETERMINATE`。同一路径的最终状态由最后一个可信 capture 决定；不可信 capture 进入 `unreconstructed`，但不会被静默丢弃。
-
-#### 第二阶段使用方式（设计目标）
-
-Opsbot 导出接口：
+1. `load_structured_records()` 按 `version` 处理：省略版本或 `version=1` 进入原有 v1 loader；`version=2` 进入 provenance loader
+2. v2 loader 先校验 `records`、`captures`、`blobs` 的类型，再解码 blob。UTF-8 内容按文本保存，base64 内容按二进制标记；每个 blob 都重新计算 SHA-256，并校验文件 size，任意 blob 损坏都会拒绝整个输入。
+3. reader 统计每个 `capture_id` 被 tool call 引用的次数，并检查 effect 引用的 blob 是否存在。唯一引用得到 `association_quality=exact`；多次引用或 capture 自身为 `ambiguous` 得到 `ambiguous`；零次引用得到 `unmatched`。
+4. 转换为现有 canonical record：assistant/user 文本进入 `message.content`，工具调用进入 `tool_use` 块，工具结果进入 `tool_result`。
+5. `SessionDigest` 会继续填充原有 `user_turns`、`input_files`、`produced_files`、`commands` 和 `transcript_text`，并额外保存 `evidence_refs`、`evidence_warnings`、`evidence_metadata`、`provenance_timeline`。因此 **v1 和普通 session 的字段和判定行为不变**，v2 只是增加可供后续 analyzer/Judge/report 使用的证据。
 
 ```text
-GET /api/provenance/sessions/{session_id}/audit-evidence?project_dir=...
+sift-records v2 JSON
+        │ load_structured_records()
+        ▼
+临时 canonical JSONL
+        │ slice_transcript(kind=root/skill/agent)
+        ▼
+_digest_from_records()
+        ├─ tool_trace（包含 capture/evidence 元数据）
+        ├─ evidence_refs / evidence_warnings / evidence_metadata
+        └─ provenance_timeline
 ```
 
-成功响应是带 attachment 的 `application/json`，并设置 `Cache-Control: no-store`。Session Detail 的“文件归因”页签提供同一下载动作。未知项目 / session、插件禁用和损坏 blob 分别返回 403 / 404 / 503 / 输入错误；不生成部分可信证据包。
+#### 确定性 Provenance Analyzer
 
-导出后运行：
+入口为 `analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult`，输入为已经校验过的 `SessionDigest`，不调用 LLM。五个维度及默认语义如下：
+
+| 维度 | 检查内容 | 默认输出 |
+|---|---|---|
+| Evidence Health | quality 分布、缺失/损坏引用、unmatched、coverage warnings、无法重建文件 | `INFO/WARNING` |
+| Attribution Integrity | 写工具无 effect、错误工具产生 mutation、非写工具产生 mutation、轨迹字段不一致 | `WARNING/INDETERMINATE` |
+| File Churn | 重复修改、恢复旧 hash、后续完全覆盖、多 Agent 交替写入 | `INFO/WARNING` |
+| Actor Ownership | 每个路径的 actor、最终写入者、无交接跨 actor 写入、lineage 断裂 | `INFO/WARNING` |
+| Verification Closure | 修改后测试、测试失败后再次修改、最终修改未验证 | `WARNING/INDETERMINATE` |
+
+#### 独立 Provenance Finding
+
+不复用 `AuditFinding`，以免污染声明覆盖率或改变现有 pass/fail 数量。规划字段为：
+
+```python
+ProvenanceFinding(
+    dimension="verification_closure",
+    severity="warning",
+    code="MODIFIED_AFTER_TEST",
+    summary="测试后又修改了 src/foo.py",
+    explanation="最后一次可信修改发生在测试之后，未发现后续验证。",
+    paths=["src/foo.py"],
+    actors=["developer"],
+    capture_ids=["cap-21"],
+    tool_use_ids=["tool-21"],
+    evidence_refs=["capture:cap-21:src/foo.py"],
+    turn_refs=[25],
+)
+```
+
+`ProvenanceAuditResult` 保存 `available`、coverage、statistics、findings 和 per-file `file_timelines`，v1 或普通 session 返回 `available=false`，不产生行为 finding。
+
+#### audit 使用
 
 ```bash
 sift audit path/to/agent.md \
   --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
+  -o audit-output
 ```
 
-报告应能回答两类问题：一是“Markdown 指令是否遵守”，仍由现有 finding/verdict 回答；二是“涉及文件的事实是什么”，由 `[FILE_EFFECT]`、`capture_id + path`、quality 和有限 diff 回指。完整快照保留在证据原件中，报告只显示受 token 预算约束的 diff/excerpt；二进制只显示 hash、size 和 path。
+#### 相较原有审计的新增内容
+##### 审计证据增强
 
-#### 文件归因可以新增的审计维度
+原有审计的输入是 Markdown 声明和 agent transcript，重点回答“声明中的条件、禁令和步骤是否被遵守”，并由现有 Judge 产出 `AuditFinding`、coverage 和 PASS/FAIL 等遵循性 verdict。它主要依据消息文本、工具调用和工具结果判断，不直接验证工作树中的实际文件状态。
 
-第二阶段接入后，可在不增加结构化规则 DSL 的前提下，支持以下事实核对：
+文件归因审计增加了一层可校验的事实证据：
 
-- 路径边界：是否只修改 `src/`，是否触碰禁止目录或生成文件；
-- 关联性：工具调用声称修改文件时，是否真的产生 effect；
-- 角色边界：只读子 agent 是否产生 mutation，effect 是否落在正确 agent lineage；
-- 完成性：代码变更后是否出现对应测试或文档 effect；
-- 冲突安全：是否覆盖用户已有修改，是否存在 overlap/cross-commit；
-- 最终状态：某路径最后由哪个可信 capture 产生，是否被不可信 effect 覆盖；
-- 路径改进：模型走了不同于声明的路径时，区分“执行偏离”和“声明过时”，供 `--suggest` 参考。
+| 对比项 | 原有审计 | 文件归因增强后 |
+|---|---|---|
+| 输入 | Markdown + transcript | 在原输入之外增加 `sift-records` v2 证据包 |
+| 文件事实 | 主要根据工具文本或结果推断 | 根据 capture、mutation、before/after blob 直接确认 |
+| 关联粒度 | tool call / turn | tool call + `capture_id` + path + actor/agent lineage |
+| 时间信息 | transcript turn 顺序 | 带 timestamp、iteration、event/capture ID 的稳定 provenance timeline |
+| 可信度 | 主要由 Judge 对文本证据判断 | 保留 `observed`、`incomplete`、`conflicted`、`ambiguous`，并校验 blob 引用和 SHA-256 |
+| 输出范围 | 声明遵循性 finding 和 verdict | 在其旁边增加文件 effect、evidence refs，以及后续的 Provenance Finding |
 
-这些维度仍然是证据增强，不会把未声明工具自动判为违规，也不会因“没有文件变化”推断 agent 没有执行只读检查。
+##### 独立 Analyzer 校验报告
+
+Provenance Analyzer 的结果作为报告中的独立 `provenance` 区块输出，不并入原有报告。
+
+报告包含三个层次：
+
+1. **Provenance Overview**：显示 `available`、输入证据 SHA-256、Opsbot session ID、capture/effect 总数、涉及文件和 actor 数量、quality 分布、exact/ambiguous/unmatched 关联数、冲突数、coverage warnings，以及可重建和不可重建的文件数。`available=false` 或证据包校验失败时，报告明确显示“无可用文件归因审计”，不伪造结果。
+2. **Behavior Findings**：每条 finding 展示 `dimension`、`code`、`severity`、摘要和解释，并列出 path、actor、tool use ID、turn、capture ID、`evidence_ref`。`WARNING` 以风险提示呈现，表示事实已确认但不自动等价于声明违规；`INDETERMINATE` 以证据不足呈现，标出缺失/冲突/歧义原因，不给出确定的 PASS/FAIL。
+3. **File Timeline**：按路径展开 `before → capture/effect → after/final`。每个节点标记 timestamp、actor、tool、quality 和 evidence ref；`observed` effect 可作为可信最终状态，其他 quality 标记为 `unreconstructed`，不会覆盖最后一个可信状态。文本文件只展示受预算限制的 unified diff/excerpt，二进制只展示 path、size 和 hash。
 
 ### 13.11 改进建议（`--suggest`，可选）：FAIL 分三类 + 起草修改建议
 

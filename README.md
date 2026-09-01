@@ -217,60 +217,15 @@ sift audit path/to/skill/ --db opencode.db                            # 直接�
 
 > `--max-concurrent N`（或 env `SIFT_MAX_CONCURRENT`）：**固定** LLM 判定并发上限（关自适应）；不设则默认 **AIMD 自适应**（动态探后端容量边界，适配不同模型/服务商）。env `SIFT_ADAPTIVE_CONCURRENCY=0` 显式关自适应。大声明 / 低内存时用 `--max-concurrent` 调小。
 
-#### Opsbot 文件归因证据（`sift-records` v2，基础能力）
+#### Opsbot 文件归因证据审计
 
-当前 PR 提供的是 Sift 侧的证据读取和中间层基础能力，还不是完整的“结合文件归因进行审计”功能。Sift 可以读取 Opsbot 导出的 `sift-records` v2 JSON，校验并保存 capture、blob 和文件 effect；但现有 Judge、`AuditFinding` 和 audit 报告暂未消费这些 effect，当前审计 verdict 仍只依据既有 transcript/tool trace。
+Sift 可以读取 Opsbot 导出的 `sift-records` v2 JSON，校验并保存 capture、blob 和文件 effect；但现有 Judge、`AuditFinding` 和 audit 报告暂未消费这些 effect，当前审计 verdict 仍只依据既有 transcript/tool trace。
 
 ```bash
-# 当前可用于验证 v2 输入能被 reader/digest 接收；不表示已启用文件 effect 判定
 sift audit path/to/agent.md \
   --transcript opsbot-audit-<session>.json \
   --kind agent -o audit-output
 ```
-
-v2 顶层至少包含 `format: "sift-records"`、`version: 2`、`session`、`records`、`captures`、`blobs`、`coverage` 和 `warnings`。`records[].tool_calls[]` 保留原生 tool ID、时间、结果和 `capture_id`；`captures` 保存 actor/agent lineage、工具状态和文件 effects；`blobs` 只保存 mutation 涉及文件的 before/after 内容，并按 SHA-256 去重。完整字段定义见 [参考手册的 v2 协议](docs/sift-reference.md#sift-records-v2文件归因证据)。
-
-文件 effect 的 `quality` 分为 `observed`、`incomplete`、`conflicted`、`ambiguous`。reader 会保留这些质量信息，并将可信度传入 `SessionDigest`；只有后续接入文件 effect 判定后，`observed` 才能用于确定性重建最终文件。输入包损坏、blob 缺失或 SHA-256 不匹配时，Sift 会拒绝整个输入。v1 structured records、Claude Code JSONL 和 OpenCode session JSON 继续使用原有入口。
-
-完整的 FILE_EFFECT scene、evidence refs、Judge 约束和报告展示属于后续 PR；Opsbot exporter/API 也不属于 Sift reader 的职责。
-
-#### 完整设计与分阶段交付
-
-这项能力分成两个独立 PR，证据原件和审计判定严格分层：
-
-1. **Opsbot evidence export**：从一个 session 导出完整事件、capture、mutation 和 content-addressed blobs。导出包以 session 事件为主轨迹，用 `capture_id`/原生 `tool_use_id` 关联文件归因；无法唯一关联的 capture 不丢弃，而是标记 `ambiguous` 或 `unmatched`。
-2. **Sift file-effect audit**：读取 v2 包后，在现有 transcript scene 中加入 `[FILE_EFFECT]` 块；只把 `observed` effect 用于确定性文件状态重建，其他质量状态只作为不确定证据；Judge 返回的文件事实必须带 `capture:<capture_id>:<path>` 引用，报告展示有限 diff 和证据质量。
-
-完整数据流是：
-
-```text
-Opsbot session/events + provenance store
-        │  GET /api/provenance/sessions/{id}/audit-evidence
-        ▼
-sift-records v2 JSON（证据原件，含 blobs）
-        │  load_structured_records + hash/blob 校验
-        ▼
-canonical JSONL（现有 slice_transcript 中间格式）
-        │  _digest_from_records
-        ▼
-SessionDigest（tool_trace + FILE_EFFECT scene + evidence refs）
-        │  现有四类 Judge + 文件事实引用校验
-        ▼
-audit-report.json / audit-report.html
-```
-
-后续 Opsbot 导出接口约定：成功返回 `application/json` attachment，并设置 `Cache-Control: no-store`；未知项目返回 403、未知 session 返回 404、插件禁用返回 503，blob 损坏时拒绝生成部分包。推荐使用方式：
-
-```bash
-# Opsbot UI 导出 opsbot-audit-<session>.json 后
-sift audit path/to/agent.md \
-  --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
-```
-
-后续完整报告除了原有五态 verdict、coverage、boundary 外，还会记录输入证据 SHA-256、Opsbot session ID、coverage warnings，以及每条文件事实的 capture、path、quality、有限 unified diff。完整快照只留在输入证据包中，不嵌入报告，也不复制整个 worktree。
-
-这项设计明确不做：不新增 `workflow.audit.yaml`，不增加第二套 CLI，不把“未声明工具”自动判成违规，不把 `incomplete/conflicted/ambiguous` 当作确定性文件事实，也不在第一版做跨 session 替代路径聚合或自动修改 workflow。
 
 ### `trigger` — 触发准确度（第 4 维）
 
