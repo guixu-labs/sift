@@ -234,6 +234,44 @@ v2 顶层至少包含 `format: "sift-records"`、`version: 2`、`session`、`rec
 
 完整的 FILE_EFFECT scene、evidence refs、Judge 约束和报告展示属于后续 PR；Opsbot exporter/API 也不属于 Sift reader 的职责。
 
+#### 完整设计与分阶段交付
+
+这项能力分成两个独立 PR，证据原件和审计判定严格分层：
+
+1. **Opsbot evidence export**：从一个 session 导出完整事件、capture、mutation 和 content-addressed blobs。导出包以 session 事件为主轨迹，用 `capture_id`/原生 `tool_use_id` 关联文件归因；无法唯一关联的 capture 不丢弃，而是标记 `ambiguous` 或 `unmatched`。
+2. **Sift file-effect audit**：读取 v2 包后，在现有 transcript scene 中加入 `[FILE_EFFECT]` 块；只把 `observed` effect 用于确定性文件状态重建，其他质量状态只作为不确定证据；Judge 返回的文件事实必须带 `capture:<capture_id>:<path>` 引用，报告展示有限 diff 和证据质量。
+
+完整数据流是：
+
+```text
+Opsbot session/events + provenance store
+        │  GET /api/provenance/sessions/{id}/audit-evidence
+        ▼
+sift-records v2 JSON（证据原件，含 blobs）
+        │  load_structured_records + hash/blob 校验
+        ▼
+canonical JSONL（现有 slice_transcript 中间格式）
+        │  _digest_from_records
+        ▼
+SessionDigest（tool_trace + FILE_EFFECT scene + evidence refs）
+        │  现有四类 Judge + 文件事实引用校验
+        ▼
+audit-report.json / audit-report.html
+```
+
+后续 Opsbot 导出接口约定：成功返回 `application/json` attachment，并设置 `Cache-Control: no-store`；未知项目返回 403、未知 session 返回 404、插件禁用返回 503，blob 损坏时拒绝生成部分包。推荐使用方式：
+
+```bash
+# Opsbot UI 导出 opsbot-audit-<session>.json 后
+sift audit path/to/agent.md \
+  --transcript opsbot-audit-<session>.json \
+  --kind agent --turn-refs -o audit-output
+```
+
+后续完整报告除了原有五态 verdict、coverage、boundary 外，还会记录输入证据 SHA-256、Opsbot session ID、coverage warnings，以及每条文件事实的 capture、path、quality、有限 unified diff。完整快照只留在输入证据包中，不嵌入报告，也不复制整个 worktree。
+
+这项设计明确不做：不新增 `workflow.audit.yaml`，不增加第二套 CLI，不把“未声明工具”自动判成违规，不把 `incomplete/conflicted/ambiguous` 当作确定性文件事实，也不在第一版做跨 session 替代路径聚合或自动修改 workflow。
+
 ### `trigger` — 触发准确度（第 4 维）
 
 测 cc 会不会**仅凭 skill 的 `description` 自然触发**（不评输出对错）。前三层都假设 skill 已"上场"——scoring 强制注入 body，触发能力从不被测；trigger 补这个上游缺口：中性 prompt，看 cc 仅凭描述自动发现（用真实 HOME、不隔离——对齐 run/audit）。诊断定位、无门禁、独立 artifact（不并入 benchmark）。**生成时做 anti-leakage 校验**（探题不应照抄 description 措辞，防词面匹配虚高 recall），报告还按**措辞（词面 / 语义）+ 长度（短 / 中 / 长）分层**诊断——看 cc 是真懂还是靠字面命中触发。

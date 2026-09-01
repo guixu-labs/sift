@@ -1880,6 +1880,82 @@ sift audit path/to/agent.md \
 
 v2 包的完整快照只包含发生 mutation 的文件，不是整个 worktree。报告记录输入证据 SHA-256、session ID、capture/path/quality 和有限 diff，不重复嵌入完整快照。
 
+#### 完整设计：证据原件、中间层和判定层分离
+
+文件归因的设计目标不是替换 transcript，而是让“工具声称做了什么”和“文件实际上发生了什么”可以在同一条证据链中交叉验证。证据原件由 Opsbot 负责，Sift 只消费协议化 JSON；Sift 的既有 Markdown 指令抽取、四类 Judge、coverage、boundary 和报告体系继续作为唯一审计入口。
+
+设计分为两个交付阶段：
+
+| 阶段 | 负责仓库 | 交付内容 | 当前状态 |
+|---|---|---|---|
+| 第一阶段 | Sift | v2 reader、blob 校验、capture/effect 归一化、lineage 透传、digest timeline | 当前 PR |
+| 第二阶段 | Opsbot + Sift | Opsbot 导出 API/UI、`[FILE_EFFECT]` scene、可信文件重建、Judge evidence refs、报告展示 | 后续 PR |
+
+第一阶段先稳定证据协议，避免在 exporter、reader、Judge 三处同时猜测 session 语义。第二阶段才把文件 effect 变成可见的审计证据和新审计维度；两阶段都不引入 workflow DSL 或硬门禁。
+
+完整链路：
+
+```text
+Opsbot session events + ProvenanceStore
+        │
+        ├─ 主轨迹：user/assistant、tool call/result、iteration、subagent lifecycle、error
+        └─ 归因证据：capture、mutation、conflict、before/after blob
+        │
+        ▼
+sift-records v2 JSON（证据原件）
+        │  版本 / 引用 / SHA-256 校验
+        ▼
+canonical JSONL（现有 cc-record 形）
+        │  slice_transcript（root/skill/agent）
+        ▼
+SessionDigest
+  ├─ 原有 tool_trace / transcript_text / input_files / produced_files
+  ├─ evidence_refs: capture:<capture_id>:<path>
+  └─ provenance_timeline（稳定时间顺序）
+        │
+        ▼
+第二阶段：标准化 [FILE_EFFECT] scene → 现有 Judge
+        │
+        ▼
+audit-report（verdict + evidence refs + 有限 diff）
+```
+
+第二阶段的判定口径：`observed` capture 才能支持文件事实；`incomplete`、`conflicted`、`ambiguous` 只能导致 `INDETERMINATE` 或 warning，不能覆盖可信文件状态。若 PASS/FAIL 只引用非可信 capture，结果必须降级为 `INDETERMINATE`。同一路径的最终状态由最后一个可信 capture 决定；不可信 capture 进入 `unreconstructed`，但不会被静默丢弃。
+
+#### 第二阶段使用方式（设计目标）
+
+Opsbot 导出接口：
+
+```text
+GET /api/provenance/sessions/{session_id}/audit-evidence?project_dir=...
+```
+
+成功响应是带 attachment 的 `application/json`，并设置 `Cache-Control: no-store`。Session Detail 的“文件归因”页签提供同一下载动作。未知项目 / session、插件禁用和损坏 blob 分别返回 403 / 404 / 503 / 输入错误；不生成部分可信证据包。
+
+导出后运行：
+
+```bash
+sift audit path/to/agent.md \
+  --transcript opsbot-audit-<session>.json \
+  --kind agent --turn-refs -o audit-output
+```
+
+报告应能回答两类问题：一是“Markdown 指令是否遵守”，仍由现有 finding/verdict 回答；二是“涉及文件的事实是什么”，由 `[FILE_EFFECT]`、`capture_id + path`、quality 和有限 diff 回指。完整快照保留在证据原件中，报告只显示受 token 预算约束的 diff/excerpt；二进制只显示 hash、size 和 path。
+
+#### 文件归因可以新增的审计维度
+
+第二阶段接入后，可在不增加结构化规则 DSL 的前提下，支持以下事实核对：
+
+- 路径边界：是否只修改 `src/`，是否触碰禁止目录或生成文件；
+- 关联性：工具调用声称修改文件时，是否真的产生 effect；
+- 角色边界：只读子 agent 是否产生 mutation，effect 是否落在正确 agent lineage；
+- 完成性：代码变更后是否出现对应测试或文档 effect；
+- 冲突安全：是否覆盖用户已有修改，是否存在 overlap/cross-commit；
+- 最终状态：某路径最后由哪个可信 capture 产生，是否被不可信 effect 覆盖；
+- 路径改进：模型走了不同于声明的路径时，区分“执行偏离”和“声明过时”，供 `--suggest` 参考。
+
+这些维度仍然是证据增强，不会把未声明工具自动判为违规，也不会因“没有文件变化”推断 agent 没有执行只读检查。
+
 ### 13.11 改进建议（`--suggest`，可选）：FAIL 分三类 + 起草修改建议
 
 audit 报出 FAIL 之后，「哪些该回去改 skill、哪些其实是声明本身写得脱离实际」要靠人自己琢磨。`audit --suggest` 让 LLM 帮你做这一步：把 FAIL 归因、起草对应的修改建议。**默认不开**——audit 的本分是判对错，建议是你明确要了才给的附加品（建议不进任何 gate、不影响 exit code）。agent / 编排（`--kind agent` / `--kind root`）审计同样可用——`--kind` 只切 transcript 侧的执行段，建议归因吃的是被审的那份声明正文（.md）；归因枚举名 `skill_fix` 是 skill 时代起的，对 agent 语义就是「改 agent 正文」。
