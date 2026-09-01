@@ -22,6 +22,7 @@
   - [coverage — 出题漏测诊断](#coverage--出题漏测诊断)
   - [critique — 正文内容质量诊断](#critique--正文内容质量诊断)
   - [report — HTML 报告](#report--html-报告)
+- [sift-records v2：文件归因证据](#sift-records-v2文件归因证据)
 - [评测体系](#评测体系)
 - [JSON 输出格式](#json-输出格式)
 - [项目结构](#项目结构)
@@ -440,6 +441,61 @@ sift audit path/to/skill/ --db opencode.db
 > **「X 条由 transcript 反推」是什么**：findings 里 `derived_from_transcript: true` 的不是 SKILL.md 抽出来的，而是从 transcript 实际行为**补**出来的检查（只增不减）。当前只补一类：transcript 里 agent 真实 Read 过的输入/参考文件（`digest.input_files`）→ 各补一条「读取 \<path\>」（REFERENCE_USAGE）。例：SKILL.md 只写"读用户指定的日志文件"不点名，transcript 实际读了 `app.log` → 反推一条「读取 app.log」并确认命中。这类由 Read 行为反推的 read 检查构造上即 PASS（不膨胀 fail），作用是把 agent 真碰过的输入文件记进报告。`required_tools`（Bash 命令分不清业务/通用）、`required_outputs`（历史 trace 产物未必还在盘）不反推。
 
 > **怎么看结果（别只数 fail）**：每条 finding 带 **#N 序号**。① **同文重复已去重**——同句被抽成 `CONSTRAINT` + `ANTI_FABRICATION` 的合并成一条、来源徽章显 `CONSTRAINT + ANTI_FABRICATION`（不再虚增 fail）。② **同行为跨类已关联**——同一行为（如没读某 reference）同时违反 条件性 + 步骤 两条**不同**规则的，仍是两条（确是两条规则），但互标 `↔ 同源 #N`（可点跳）；故 fail 条数仍可能 > 真实问题数，**逐条看 evidence 对照"哪个行为"**，别数条数。**同源矛盾已标注**——同一声明行被多个镜头抽取（如禁令 + 步骤各收一行）后判出一 PASS 一 FAIL 的，两条互标 `⊘ 判定矛盾 #N`（可点跳对端），警告框报「同源矛盾 N 组…建议人工复核对端证据」；标注不仲裁（不翻判、不加第三方判官），谁对谁错看两端 evidence 人工定夺。③ **没判成（UNRESOLVED）多 ≠ 全过**——LLM 没判成的一律 UNRESOLVED（见上），汇总成警告提示重跑；N/A（不适用）是已解决结论、不进警告。④ **对照预期**：自带 3 个 audit 示例的预期违规已逐条列明（见 [example-skills/README.md](../fixtures/example-skills/README.md)），跑完比对该抓的违规是否都出现在 FAIL、evidence 是否点中。⑤ **verdict 徽章 + method 标签**（每条）：左侧 verdict 五态图标（✓通过 / ✗失败 / ⊘不适用（场景不触发）/ ○没判成（可重跑）/ ?判不准（重跑无益）），右侧 method 标签「程序」（tool_trace 命中 / 子串匹配，不调 LLM）或「LLM」。⑥ **FAIL 噪声判别**（每条 FAIL + by_instruction 失败行）：`noise_label` 徽章（`tool_noise` 疑似工具噪声 / `skill_issue` 疑似声明问题 / `uncertain` 待确认）+ `noise_reasons`（hover 看理由）。fixture 下 FAIL 混着工具噪声（extractor 误提资源描述当步骤、evidence 自相矛盾、LLM 判定不稳）和真声明问题（硬约束程序判定 FAIL），判别帮区分、避免据噪声误改声明。治本仍 `--refine-instructions` / 结构化声明 / 真实 transcript audit。**source / category 徽章**：单次 audit-report、viewer per-run、整体汇总三处都显 `source`（InstructionSource，如 `CONSTRAINT` / `HEADING_STEP`）+ `category` —— `source` 比 `category` 细（6 vs 4），是判别噪声的关键信号（如 `HEADING_STEP` + 资源链接 → 疑似资源描述被当步骤）。⑦ **声明覆盖视图怎么读**（③b 区块 / CLI 一行）：covered/total 是本批对账的**证据面**——低覆盖 ≠ 声明差（条件式指令场景没触发很正常），但意味着上面的 FAIL 结论只覆盖被触达的子集；unknown 先治「建议重跑」的 UNRESOLVED（重跑常能把它变 covered/uncovered）；uncovered 集中的分组 = 该批会话没锻炼到的声明面，想验证就补跑对口场景的 transcript 再对账。⑧ **工具对账视图怎么读**（③c 区块 / CLI 一行）：「未声明」≠ 违规——声明通常不穷举工具（bash/read 本就不在声明里；skill/agent/编排声明同理），未命中只说明声明没写；此视图**不构成违规判定**（不产 finding、不进 verdict），用途是给「轨迹里出现了哪些声明之外的领域工具」一个诚实的数据面：一眼看出会话调了哪些 MCP/领域工具、哪些在声明工具要求里、哪些没有。它也是二期 per-skill 行为基线（声明工具要求 ∪ 零 FAIL 会话观测双源交叉后升级判罚）的数据采集面——本期的 sessions/calls 列就是在攒基线数据。⑨ **控制流 finding 怎么读**：声明里写了**显式顺序连词**（先/然后/再/接着/随后/之后/其次/下一步/最后 等）的同节相邻步骤，会多出一条合成 finding——`(顺序)「A」须先于「B」`。它是审计器**合成的关系声明**（`synthetic`），**不进**声明覆盖视图与 by_instruction 聚合表（不是声明原文指令），只在 ④ 明细出现，`↔ 同源` 链两端可点跳到 A/B 两条真实 finding。判定口径**宁少报**：只有 B 的**全部**证据都先于 A 才算违序（交错/部分重排算过），A 或 B 压根没发生算不适用；**数字编号列表（1. 2. 3.）不算顺序声明**（编号是排版惯例，倒序执行常常无害）。带**数量词**（每个/所有/逐个/至少 N 次/不超过 N 次…）的指令会移交给**控制流判官**判（不再由原条件/禁令/步骤判官判，每条指令仍只有一个 verdict）：「应做未做、数量不足」一律 FAIL（不洗成不适用），evidence 带实测数字与期望——但**窗口与条件边界**例外：单条任务级条目所属的任务/阶段在记录里从未开始（记录止于某处、该条目排在其后），或条件触发型条目（「据 X 的失败报告修复」类）的触发条件在记录里从未发生，判 N/A（证据不覆盖/条件未触发）；所属阶段已开始、条目中途没走的仍 FAIL。**完成度类**（逐一完成/全部完成其中的 Tasks/项）**以本执行记录为全集**——对账对象就是这份记录，记录结束时未完成就是数量不足（FAIL），判官不得推测「记录之外可能继续」来洗成 pass/na；「按顺序」与「完成全部」同现时完成度是主判据，记录内的顺序合规不掩盖数量不足（窗口外步骤/单条任务级条目逐条判 N/A 与此不矛盾：条目级不逐条冤枉，整体缺口由完成度条目兜底报出，单条判 N/A 不算漏报）。count 型且带工具名的少数场景由程序数 tool_trace 调用次数（method=程序，evidence 如「实测调用 X 1 次,不满足『至少 2 次』」）。数量 finding 用原指令原文/原类别（对聚合透明），但带 `control_flow="quantity"` 纯显示标记：CLI 违规表在指令前显 `(数量)`、HTML 概要表（违规 FAIL 行）与 finding 头挂「数量」徽章（聚合行透传同名字段）——不挂记号它在报告里长得跟普通 conditional/step 判定一模一样，认不出（ORDER 靠 `(顺序)` 合成文案自明，不另标）。⑩ **改进建议怎么读**（`--suggest` 可选、默认关；建议区块 / CLI 一行）：三类归因——`skill_fix`（声明写了、执行系统性没做到 → 改 skill 正文的建议）/ `declaration_fix`（执行做了更合理的事、声明过时 → 改声明的建议）/ 模型·环境（单发失败、工具噪声 → **不出建议**，只透明计数「N 条 FAIL 归因为模型/环境」）。每条建议带 #N 链接（点跳对应 FAIL finding）+ keeps_pass 徽章（自检不与 PASS 指令撞车；⚠ 未自检通过 = LLM 自己声明有冲突，人工复核）；skipped_reason 非空时只显原因行（失败 ≠ 全怪模型）。建议**仅供参考**——审计的判决不受建议影响（独立性红线）。
+
+## sift-records v2：文件归因证据
+
+Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 导出为一个结构化 JSON，再直接作为 `--transcript` 输入。顶层 `format` 仍是 `sift-records`，因此旧 reader 可以识别；`version: 2` 启用文件证据校验和 lineage 透传。
+
+### 顶层字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `format` | string | 固定为 `sift-records` |
+| `version` | integer | `2`；省略时按 v1 处理 |
+| `producer` | string | 证据包生产方，例如 `opsbot-file-provenance` |
+| `exported_at` | string | 导出时间 |
+| `session` | object | session ID、native session 和父子 lineage 等元数据 |
+| `records` | array | 按时间排序的 user/assistant turn；工具调用放在 `tool_calls` |
+| `captures` | object | `capture_id` 到工具生命周期和文件 effects 的映射 |
+| `blobs` | object | content-addressed before/after 文件内容 |
+| `coverage` | object | producer 已知的证据覆盖情况 |
+| `warnings` | array | producer 或 reader 需要人工关注的缺口 |
+
+### capture、effect 和 blob 规则
+
+- `records[].tool_calls[]` 可以携带原生 `id`、`timestamp`、`result`、`is_error` 和 `capture_id`。Sift 会保留这些信息，不为 v2 工具调用重建虚假的关联 ID。
+- `captures[capture_id]` 保存 actor、agent、runtime/model、工具生命周期、父子 session lineage 和 `effects`。即使没有 mutation，capture 也必须保留，表示工具执行过但没有产生文件变化。
+- `effects[]` 至少包含 `path`；可以提供 `before_blob`、`after_blob`、`additions`、`deletions` 和 `conflict`。文件证据引用采用 `capture:<capture_id>:<path>`。
+- `blobs` 只包含 mutation 涉及文件的完整 before/after 字节，不是整个 worktree 快照。`encoding` 为 `utf-8` 时保存文本，为 `base64` 时保存二进制。
+- Sift 会校验 blob 的 SHA-256 和 size，以及 effect 对 blob 的引用。缺失引用、损坏内容或 hash 不匹配会使整个输入失败，不生成部分可信报告。
+
+`captures[].quality` 只接受以下四种值：
+
+| quality | 语义 | Sift 行为 |
+|---|---|---|
+| `observed` | 完整、无冲突且关联可用 | 可用于重建可信文件状态 |
+| `incomplete` | 生命周期或 before/after 证据不完整 | 保留证据，但不覆盖可信状态 |
+| `conflicted` | 存在重叠、冲突或跨 commit 情况 | 保留证据，但不覆盖可信状态 |
+| `ambiguous` | 无法唯一归属到工具调用 | 保留为 standalone capture，不伪造 tool call |
+
+一个 capture 被多个 tool call 引用时，或 capture 自身为 `ambiguous`，reader 会将其关联质量标记为 `ambiguous`。完全没有 tool call 引用的 capture 标记为 `unmatched`，仍会写入 canonical record 的 `_sift_standalone_capture` 字段，供 loose/root/agent 审计查看；Skill 切片不会把它归给附近的 Skill 调用。
+
+### 进入 audit 的中间格式
+
+CLI 检测到 `sift-records` JSON 后，调用 `load_structured_records()` 将它展开为临时 canonical JSONL，再交给既有 `slice_transcript()`、`_digest_from_records()` 和 `TranscriptAuditor`。因此：
+
+- `slice_transcript()` 接收的是 canonical JSONL，不直接解析 v2 顶层 bundle JSON；
+- `_sift_bundle_meta` 只附在第一个 canonical record 上，切片时复制到每个 segment 的第一条记录；
+- 关联 capture 放在工具块的 `_sift_evidence`，standalone capture 放在 `_sift_standalone_capture`；
+- `SessionDigest` 保存 `evidence_refs`、`evidence_warnings`、`evidence_metadata` 和 `provenance_timeline`，同时继续填充原有 `tool_trace`、`input_files`、`produced_files`。
+
+```bash
+sift audit path/to/agent.md \
+  --transcript opsbot-audit-<session>.json \
+  --kind agent --turn-refs -o audit-output
+```
+
+`--kind`、多 transcript 聚合、coverage、boundary 和现有报告参数均保持不变。文件归因是审计辅助证据：它可以支撑“谁修改了哪个路径、最终可信状态由哪次 capture 产生”等事实，但不能单独证明完整 workflow 已执行，也不会把“未声明工具”自动判成违规。
 
 ### `trigger` — 触发准确度（第 4 维）
 

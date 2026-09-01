@@ -217,6 +217,22 @@ sift audit path/to/skill/ --db opencode.db                            # 直接�
 
 > `--max-concurrent N`（或 env `SIFT_MAX_CONCURRENT`）：**固定** LLM 判定并发上限（关自适应）；不设则默认 **AIMD 自适应**（动态探后端容量边界，适配不同模型/服务商）。env `SIFT_ADAPTIVE_CONCURRENCY=0` 显式关自适应。大声明 / 低内存时用 `--max-concurrent` 调小。
 
+#### Opsbot 文件归因证据（`sift-records` v2）
+
+Opsbot 可以把 session 事件和文件归因 capture 导出为一个 `sift-records` v2 JSON。它是审计的证据原件，不是另一套审计命令：Sift 会先把它展开成内部 canonical JSONL，再复用现有的切片、digest、Judge 和报告流程。
+
+```bash
+sift audit path/to/agent.md \
+  --transcript opsbot-audit-<session>.json \
+  --kind agent --turn-refs -o audit-output
+```
+
+v2 顶层至少包含 `format: "sift-records"`、`version: 2`、`session`、`records`、`captures`、`blobs`、`coverage` 和 `warnings`。`records[].tool_calls[]` 保留原生 tool ID、时间、结果和 `capture_id`；`captures` 保存 actor/agent lineage、工具状态和文件 effects；`blobs` 只保存 mutation 涉及文件的 before/after 内容，并按 SHA-256 去重。完整字段定义见 [参考手册的 v2 协议](docs/sift-reference.md#sift-records-v2文件归因证据)。
+
+文件 effect 的 `quality` 分为 `observed`、`incomplete`、`conflicted`、`ambiguous`。只有 `observed` effect 可以用于确定性重建最终文件；其余 effect 仍会显示在证据链中，但不会覆盖可信状态，并会进入 warnings / unreconstructed。没有文件 mutation 的 capture 也会保留，表示工具执行过但没有产生文件变化。
+
+输入包损坏、blob 缺失或 SHA-256 不匹配时，Sift 会拒绝整个输入，不生成部分可信报告。v1 structured records、Claude Code JSONL 和 OpenCode session JSON 继续使用原有入口；Opsbot exporter/API 不属于 Sift reader 的职责。
+
 ### `trigger` — 触发准确度（第 4 维）
 
 测 cc 会不会**仅凭 skill 的 `description` 自然触发**（不评输出对错）。前三层都假设 skill 已"上场"——scoring 强制注入 body，触发能力从不被测；trigger 补这个上游缺口：中性 prompt，看 cc 仅凭描述自动发现（用真实 HOME、不隔离——对齐 run/audit）。诊断定位、无门禁、独立 artifact（不并入 benchmark）。**生成时做 anti-leakage 校验**（探题不应照抄 description 措辞，防词面匹配虚高 recall），报告还按**措辞（词面 / 语义）+ 长度（短 / 中 / 长）分层**诊断——看 cc 是真懂还是靠字面命中触发。

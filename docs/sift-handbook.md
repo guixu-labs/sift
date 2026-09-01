@@ -1848,7 +1848,38 @@ audit 不 re-run cc、只对账已有 transcript，所以「transcript 从哪来
 
 ---
 
-### 13.10 改进建议（`--suggest`，可选）：FAIL 分三类 + 起草修改建议
+### 13.10 文件归因证据：把“谁改了什么”接入 audit
+
+当 transcript 还能提供文件归因 capture 时，审计不再只能回答“调用了哪个工具”，还可以回答“哪个 agent 的哪次工具调用实际改变了哪个文件”。Opsbot 的导出包采用 `sift-records` v2；Sift 仍沿用现有 `audit` 命令，不增加第二套审计入口。
+
+```bash
+sift audit path/to/agent.md \
+  --transcript opsbot-audit-<session>.json \
+  --kind agent --turn-refs -o audit-output
+```
+
+处理链路如下：
+
+1. reader 校验顶层版本、capture 引用和每个 blob 的 SHA-256/size；任一引用损坏，整个输入失败，不生成部分可信包。
+2. reader 把每个 turn 展开成现有 canonical record。工具块保留原生 tool ID、`capture_id`、agent/session lineage；无法唯一关联的 capture 作为 standalone evidence 保留，不伪造 tool call。
+3. digest 从 `observed` capture 建立 `capture:<capture_id>:<path>` evidence ref 和文件效果；按时间、event ID、capture ID 稳定排序形成 provenance timeline。
+4. `incomplete`、`conflicted`、`ambiguous` effect 不覆盖可信文件状态，但会进入 `unreconstructed` 和 warnings。这样“文件发生过变化”和“这次变化可以确定归因”是两个独立结论。
+5. 现有 Judge 继续负责 Markdown 指令遵循性；文件 effect 是可引用的辅助证据，不会把“未声明的工具”自动判成违规。
+
+质量状态的含义：
+
+| quality | 可否作为确定性文件事实 | 典型原因 |
+|---|---|---|
+| `observed` | 可以 | capture 完整、无冲突、关联唯一 |
+| `incomplete` | 不可以 | 生命周期或 before/after 证据缺失 |
+| `conflicted` | 不可以 | 重叠 mutation、冲突或跨 commit |
+| `ambiguous` | 不可以 | capture 无法唯一关联到 tool call |
+
+文件归因能支持的审计问题包括：限制修改目录、检查代码变更后是否补测试、识别禁止修改的生成文件、判断子 agent 是否写文件、核对工具结果与真实文件 effect、以及追踪某路径最后一个可信 capture。它不能单独证明完整 workflow 已执行，也不能把未变化的文件当成“未检查”；这些仍需 transcript、声明和人工复核共同判断。
+
+v2 包的完整快照只包含发生 mutation 的文件，不是整个 worktree。报告记录输入证据 SHA-256、session ID、capture/path/quality 和有限 diff，不重复嵌入完整快照。
+
+### 13.11 改进建议（`--suggest`，可选）：FAIL 分三类 + 起草修改建议
 
 audit 报出 FAIL 之后，「哪些该回去改 skill、哪些其实是声明本身写得脱离实际」要靠人自己琢磨。`audit --suggest` 让 LLM 帮你做这一步：把 FAIL 归因、起草对应的修改建议。**默认不开**——audit 的本分是判对错，建议是你明确要了才给的附加品（建议不进任何 gate、不影响 exit code）。agent / 编排（`--kind agent` / `--kind root`）审计同样可用——`--kind` 只切 transcript 侧的执行段，建议归因吃的是被审的那份声明正文（.md）；归因枚举名 `skill_fix` 是 skill 时代起的，对 agent 语义就是「改 agent 正文」。
 
