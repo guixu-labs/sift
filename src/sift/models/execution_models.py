@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +33,92 @@ class ToolCallRecord(BaseModel):
     input_summary: str = ""  # json.dumps(input)[:200],显示用(报告/prompt);匹配优先用 input
     input: dict | None = None  # 完整结构化参数(不截断),供参数级匹配/路径规范化;None=无结构化数据
     turn: int | None = None  # 该 tool_use 所属的全局 turnIndex(None=未标注)
+    tool_use_id: str | None = None
+    timestamp: str | None = None
+    record_timestamp: str | None = None
+    event_id: str | None = None
+    iteration: int | None = None
+    result: object | None = None
+    is_error: bool | None = None
+    capture_id: str | None = None
+    evidence_quality: Literal["observed", "incomplete", "conflicted", "ambiguous"] | None = None
+    association_quality: Literal["exact", "ambiguous", "unmatched"] | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    agent: str | None = None
+    parent_agent: str | None = None
+    parent_tool_use_id: str | None = None
+    session_id: str | None = None
+    native_session_id: str | None = None
+    parent_native_session_id: str | None = None
+    runtime: str | None = None
+    model: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    succeeded: bool | None = None
+
+
+class FileEffectRecord(BaseModel):
+    """一个 content-addressed 文件效果；完整内容只在 digest 内存中使用。"""
+
+    path: str
+    evidence_ref: str
+    quality: Literal["observed", "incomplete", "conflicted", "ambiguous"]
+    capture_id: str
+    actor: str = ""
+    tool_name: str = ""
+    additions: int = 0
+    deletions: int = 0
+    conflict: bool = False
+    before_blob: str | None = None
+    after_blob: str | None = None
+    before_content: str | None = None
+    after_content: str | None = None
+    before_binary: bool = False
+    after_binary: bool = False
+    before_size: int | None = None
+    after_size: int | None = None
+
+
+class ProvenanceEvent(BaseModel):
+    """按时间稳定排序的 capture 事件，供后续 provenance-native audit 使用。"""
+
+    sequence: int = 0
+    timestamp: str | None = None
+    record_timestamp: str | None = None
+    tool_timestamp: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    event_id: str | None = None
+    capture_id: str
+    tool_use_id: str | None = None
+    association_quality: Literal["exact", "ambiguous", "unmatched"]
+    quality: Literal["observed", "incomplete", "conflicted", "ambiguous"]
+    actor_kind: str | None = None
+    agent: str | None = None
+    parent_agent: str | None = None
+    native_agent_id: str | None = None
+    iteration: int | None = None
+    parent_tool_use_id: str | None = None
+    session_id: str | None = None
+    native_session_id: str | None = None
+    parent_native_session_id: str | None = None
+    tool_name: str | None = None
+    tool_input: object | None = None
+    tool_output: object | None = None
+    runtime: str | None = None
+    model: str | None = None
+    succeeded: bool | None = None
+    is_error: bool | None = None
+    incomplete: bool = False
+    conflicted: bool = False
+    conflicts: list[object] = Field(default_factory=list)
+    mutation_reasons: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    head_before: str | None = None
+    head_after: str | None = None
+    committed_sha: str | None = None
+    attributes: dict = Field(default_factory=dict)
+    effects: list[FileEffectRecord] = Field(default_factory=list)
 
 
 class RunOutput(BaseModel):

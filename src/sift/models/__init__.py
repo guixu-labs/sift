@@ -67,6 +67,8 @@ from sift.models.eval_models import (
 )
 from sift.models.execution_models import (
     CheckResult,
+    FileEffectRecord,
+    ProvenanceEvent,
     RunConfig,
     RunOutput,
     ScoringConfig,
@@ -136,6 +138,8 @@ __all__ = [
     "RunOutput",
     "ScoringConfig",
     "ToolCallRecord",
+    "FileEffectRecord",
+    "ProvenanceEvent",
     # Benchmark models
     "AnalysisReport",
     "AnomalyReport",

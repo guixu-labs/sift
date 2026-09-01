@@ -161,6 +161,11 @@ def _slice_skill_invoke(records: list[dict], target: str) -> list[list[dict]]:
             skill_spans.append(state["cur"])
 
     for i, rec in enumerate(records):
+        # Unmatched capture has no reliable Skill invocation association.  Keep
+        # it for loose/root/agent audit, but do not silently assign it to the
+        # last active skill merely because it was serialized nearby.
+        if rec.get("_sift_standalone_capture"):
+            continue
         scope = _scope_of(rec)
         state = scope_state.setdefault(scope, {"active": None, "cur": []})
 
@@ -261,9 +266,24 @@ def slice_transcript(transcript_path: Path, target: str, kind: str) -> list[list
     if not records:
         return []
     if kind == "root":
-        return _slice_root(records)
-    if kind == "skill":
-        return _slice_skill_invoke(records, target)
-    if kind == "agent":
-        return _slice_agent(records, target)
-    raise ValueError(f"kind 必须是 'root' / 'skill' / 'agent',收到 {kind!r}")
+        segments = _slice_root(records)
+    elif kind == "skill":
+        segments = _slice_skill_invoke(records, target)
+    elif kind == "agent":
+        segments = _slice_agent(records, target)
+    else:
+        raise ValueError(f"kind 必须是 'root' / 'skill' / 'agent',收到 {kind!r}")
+
+    # Structured v2 keeps bundle metadata once on the first canonical record.
+    # Agent/skill slicing can exclude that record, so copy it once to the first
+    # record of every emitted segment.  This preserves input hash, coverage and
+    # warnings without repeating them on every record.
+    bundle_meta = next(
+        (record.get("_sift_bundle_meta") for record in records if record.get("_sift_bundle_meta")),
+        None,
+    )
+    if bundle_meta:
+        for segment in segments:
+            if segment:
+                segment[0]["_sift_bundle_meta"] = bundle_meta
+    return segments

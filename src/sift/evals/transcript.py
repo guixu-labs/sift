@@ -31,11 +31,12 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from sift.models import ToolCallRecord
+from sift.models import FileEffectRecord, ProvenanceEvent, ToolCallRecord
 
 _LINE_NUM_RE = re.compile(r"^\s*\d+\t", re.MULTILINE)
 
@@ -64,6 +65,10 @@ class SessionDigest(BaseModel):
     # 以下两字段为 audit 命令重建(工具指令对账 / 文本回放)预留,默认空,非侵入。
     tool_trace: list[ToolCallRecord] = Field(default_factory=list)
     transcript_text: str = ""
+    evidence_refs: dict[str, FileEffectRecord] = Field(default_factory=dict)
+    evidence_warnings: list[str] = Field(default_factory=list)
+    evidence_metadata: dict = Field(default_factory=dict)
+    provenance_timeline: list[ProvenanceEvent] = Field(default_factory=list)
 
     @property
     def manifest(self) -> set[str]:
@@ -137,6 +142,19 @@ def _rel(path: str, root: str) -> str:
         return os.path.relpath(path, root)
     except ValueError:
         return path
+
+
+def _build_timestamp_sort_key(value: str | None) -> tuple[int, float, str]:
+    """ISO-8601 chronological key; malformed/missing values sort deterministically last."""
+    if not value:
+        return (2, 0.0, "")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (0, parsed.timestamp(), "")
+    except ValueError:
+        return (1, 0.0, value)
 
 
 # 工具名归一表:producer(opencode / insight 等)多用小写,cc digest 的分支认大写。
@@ -228,12 +246,100 @@ def _digest_from_records(
     all_paths: list[str] = []
     tool_trace: list[ToolCallRecord] = []
     transcript_text_parts: list[str] = []
+    evidence_refs: dict[str, FileEffectRecord] = {}
+    evidence_warnings: list[str] = []
+    evidence_metadata: dict = {}
+    provenance_by_capture: dict[str, ProvenanceEvent] = {}
+
+    def _record_capture_event(
+        raw_capture: object,
+        rec: dict,
+        *,
+        tool_use_id: str | None = None,
+        tool_timestamp: str | None = None,
+    ) -> ProvenanceEvent | None:
+        if not isinstance(raw_capture, dict) or not raw_capture.get("capture_id"):
+            return None
+        capture_id = str(raw_capture["capture_id"])
+        effects: list[FileEffectRecord] = []
+        for raw_effect in raw_capture.get("effects") or []:
+            if not isinstance(raw_effect, dict) or not raw_effect.get("path"):
+                continue
+            effect = FileEffectRecord.model_validate({
+                **raw_effect,
+                "evidence_ref": raw_effect.get("evidence_ref")
+                    or f"capture:{capture_id}:{raw_effect['path']}",
+                "quality": raw_capture.get("quality"),
+                "capture_id": capture_id,
+                "actor": raw_capture.get("actor") or raw_capture.get("agent") or rec.get("agent") or "",
+                "tool_name": raw_capture.get("tool_name") or "",
+            })
+            effects.append(effect)
+            evidence_refs[effect.evidence_ref] = effect
+            remember(effect.path)
+
+        event = ProvenanceEvent.model_validate({
+            "timestamp": raw_capture.get("started_at") or tool_timestamp or rec.get("timestamp"),
+            "record_timestamp": rec.get("timestamp"),
+            "tool_timestamp": tool_timestamp,
+            "started_at": raw_capture.get("started_at"),
+            "finished_at": raw_capture.get("finished_at"),
+            "event_id": rec.get("event_id"),
+            "capture_id": capture_id,
+            "tool_use_id": raw_capture.get("tool_use_id") or tool_use_id,
+            "association_quality": raw_capture.get("association_quality") or "unmatched",
+            "quality": raw_capture.get("quality"),
+            "actor_kind": raw_capture.get("actor_kind"),
+            "agent": raw_capture.get("agent") or rec.get("agent"),
+            "parent_agent": raw_capture.get("parent_agent") or rec.get("parent_agent"),
+            "native_agent_id": raw_capture.get("native_agent_id"),
+            "iteration": rec.get("iteration") if rec.get("iteration") is not None
+                else raw_capture.get("iteration"),
+            "parent_tool_use_id": raw_capture.get("parent_tool_use_id")
+                or rec.get("parent_tool_use_id"),
+            "session_id": raw_capture.get("session_id") or rec.get("session_id"),
+            "native_session_id": raw_capture.get("native_session_id")
+                or rec.get("native_session_id"),
+            "parent_native_session_id": raw_capture.get("parent_native_session_id")
+                or rec.get("parent_native_session_id"),
+            "tool_name": raw_capture.get("tool_name"),
+            "tool_input": raw_capture.get("tool_input"),
+            "tool_output": raw_capture.get("tool_output"),
+            "runtime": raw_capture.get("runtime"),
+            "model": raw_capture.get("model"),
+            "succeeded": raw_capture.get("succeeded"),
+            "is_error": raw_capture.get("is_error"),
+            "incomplete": raw_capture.get("incomplete", False),
+            "conflicted": raw_capture.get("conflicted", False),
+            "conflicts": raw_capture.get("conflicts") or [],
+            "mutation_reasons": raw_capture.get("mutation_reasons") or [],
+            "cwd": raw_capture.get("cwd"),
+            "head_before": raw_capture.get("head_before"),
+            "head_after": raw_capture.get("head_after"),
+            "committed_sha": raw_capture.get("committed_sha"),
+            "attributes": raw_capture.get("attributes") or {},
+            "effects": effects,
+        })
+        provenance_by_capture.setdefault(capture_id, event)
+        return provenance_by_capture[capture_id]
 
     def remember(p: str) -> None:
         if p and p not in all_paths:
             all_paths.append(p)
 
     for rec in records:
+        bundle_meta = rec.get("_sift_bundle_meta")
+        if isinstance(bundle_meta, dict):
+            if not evidence_metadata:
+                evidence_metadata = {
+                    key: value for key, value in bundle_meta.items()
+                    if key != "unmatched_captures"
+                }
+            evidence_warnings.extend(str(w) for w in bundle_meta.get("warnings") or [])
+            coverage = bundle_meta.get("coverage") or {}
+            if isinstance(coverage, dict):
+                evidence_warnings.extend(str(w) for w in coverage.get("warnings") or [])
+        _record_capture_event(rec.get("_sift_standalone_capture"), rec)
         msg = rec.get("message") or {}
         role = msg.get("role")
         content = msg.get("content")
@@ -273,6 +379,14 @@ def _digest_from_records(
             name = b.get("name", "")
             inp = b.get("input", {}) or {}
             tid = b.get("id", "")
+            structured_v2 = "_sift_evidence" in b
+            raw_evidence = b.get("_sift_evidence")
+            event = _record_capture_event(
+                raw_evidence,
+                rec,
+                tool_use_id=str(tid) if structured_v2 and tid else None,
+                tool_timestamp=b.get("_sift_timestamp"),
+            )
             # 无条件收集所有 tool_use 块(在按工具名分支之前):
             # 现有分支只覆盖 Skill/Read/Write/Edit/MultiEdit/Bash,
             # Glob/Grep/WebSearch 等会被忽略。tool_trace 必须收全部,
@@ -283,6 +397,32 @@ def _digest_from_records(
                 input_summary=json.dumps(b.get("input") or {}, ensure_ascii=False)[:200],
                 input=inp or None,  # 完整结构化参数(不截断),供参数级匹配/路径规范化;inp 见上(line 274)
                 turn=turn_idx if locate_turns else None,
+                tool_use_id=str(tid) if structured_v2 and tid else None,
+                timestamp=b.get("_sift_timestamp"),
+                record_timestamp=rec.get("timestamp"),
+                event_id=rec.get("event_id"),
+                iteration=rec.get("iteration"),
+                result=b.get("_sift_result"),
+                is_error=b.get("_sift_is_error") if b.get("_sift_is_error") is not None
+                    else event.is_error if event else None,
+                capture_id=event.capture_id if event else None,
+                evidence_quality=event.quality if event else None,
+                association_quality=event.association_quality if event else None,
+                evidence_refs=[effect.evidence_ref for effect in event.effects] if event else [],
+                agent=rec.get("agent") or (event.agent if event else None),
+                parent_agent=rec.get("parent_agent") or (event.parent_agent if event else None),
+                parent_tool_use_id=rec.get("parent_tool_use_id")
+                    or (event.parent_tool_use_id if event else None),
+                session_id=rec.get("session_id") or (event.session_id if event else None),
+                native_session_id=rec.get("native_session_id")
+                    or (event.native_session_id if event else None),
+                parent_native_session_id=rec.get("parent_native_session_id")
+                    or (event.parent_native_session_id if event else None),
+                runtime=event.runtime if event else None,
+                model=event.model if event else None,
+                started_at=event.started_at if event else None,
+                finished_at=event.finished_at if event else None,
+                succeeded=event.succeeded if event else None,
             ))
             if name == "Skill":
                 if not skill_used:
@@ -364,11 +504,25 @@ def _digest_from_records(
     unrecon = sorted({_rel(p, root) for p in (demoted | bash_touched) if p})
     unrecon = [u for u in unrecon if u not in produced_paths]
 
+    timeline = sorted(
+        provenance_by_capture.values(),
+        key=lambda event: (
+            _build_timestamp_sort_key(event.timestamp),
+            event.event_id or event.capture_id,
+            event.capture_id,
+        ),
+    )
+    timeline = [event.model_copy(update={"sequence": index}) for index, event in enumerate(timeline, 1)]
+
     return SessionDigest(
         skill_used=skill_used, user_turns=user_turns,
         input_files=inputs, produced_files=produced,
         unreconstructed=unrecon, commands=commands,
         tool_trace=tool_trace, transcript_text="\n".join(transcript_text_parts),
+        evidence_refs=evidence_refs,
+        evidence_warnings=list(dict.fromkeys(evidence_warnings)),
+        evidence_metadata=evidence_metadata,
+        provenance_timeline=timeline,
     )
 
 
