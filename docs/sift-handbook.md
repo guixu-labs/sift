@@ -1848,14 +1848,15 @@ audit 不 re-run cc、只对账已有 transcript，所以「transcript 从哪来
 
 ---
 
-### 13.10 文件归因证据：把“谁改了什么”接入 audit
+### 13.10 文件归因证据：Sift 侧证据层基础能力
 
-当 transcript 还能提供文件归因 capture 时，审计不再只能回答“调用了哪个工具”，还可以回答“哪个 agent 的哪次工具调用实际改变了哪个文件”。Opsbot 的导出包采用 `sift-records` v2；Sift 仍沿用现有 `audit` 命令，不增加第二套审计入口。
+当前 PR 只把 Opsbot 文件归因证据接入 Sift 的 reader 和 `SessionDigest`，尚未把它升级为新的审计判定维度。也就是说，Sift 现在可以保存“哪个 agent 的哪次工具调用可能改变了哪个文件”，但现有 Judge、`AuditFinding` 和报告仍只按既有 transcript/tool trace 生成 verdict。
 
 ```bash
+# 可用于验证 v2 输入能被 reader/digest 接收；当前不会改变文件审计 verdict
 sift audit path/to/agent.md \
   --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
+  --kind agent -o audit-output
 ```
 
 处理链路如下：
@@ -1864,7 +1865,7 @@ sift audit path/to/agent.md \
 2. reader 把每个 turn 展开成现有 canonical record。工具块保留原生 tool ID、`capture_id`、agent/session lineage；无法唯一关联的 capture 作为 standalone evidence 保留，不伪造 tool call。
 3. digest 从 `observed` capture 建立 `capture:<capture_id>:<path>` evidence ref 和文件效果；按时间、event ID、capture ID 稳定排序形成 provenance timeline。
 4. `incomplete`、`conflicted`、`ambiguous` effect 不覆盖可信文件状态，但会进入 `unreconstructed` 和 warnings。这样“文件发生过变化”和“这次变化可以确定归因”是两个独立结论。
-5. 现有 Judge 继续负责 Markdown 指令遵循性；文件 effect 是可引用的辅助证据，不会把“未声明的工具”自动判成违规。
+5. 现有 Judge 继续负责 Markdown 指令遵循性；本 PR 尚未将文件 effect 渲染进 Judge scene，也不会把“未声明的工具”自动判成违规。
 
 质量状态的含义：
 
@@ -1875,7 +1876,7 @@ sift audit path/to/agent.md \
 | `conflicted` | 不可以 | 重叠 mutation、冲突或跨 commit |
 | `ambiguous` | 不可以 | capture 无法唯一关联到 tool call |
 
-文件归因能支持的审计问题包括：限制修改目录、检查代码变更后是否补测试、识别禁止修改的生成文件、判断子 agent 是否写文件、核对工具结果与真实文件 effect、以及追踪某路径最后一个可信 capture。它不能单独证明完整 workflow 已执行，也不能把未变化的文件当成“未检查”；这些仍需 transcript、声明和人工复核共同判断。
+未来接入判定层后，文件归因可以支持：限制修改目录、检查代码变更后是否补测试、识别禁止修改的生成文件、判断子 agent 是否写文件、核对工具结果与真实文件 effect，以及追踪某路径最后一个可信 capture。当前这些问题不会自动出现在 audit verdict 中；它们仍需读取 `SessionDigest` 的证据字段或等待后续 FILE_EFFECT/Judge/report 接入。
 
 v2 包的完整快照只包含发生 mutation 的文件，不是整个 worktree。报告记录输入证据 SHA-256、session ID、capture/path/quality 和有限 diff，不重复嵌入完整快照。
 

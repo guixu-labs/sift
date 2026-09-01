@@ -444,7 +444,7 @@ sift audit path/to/skill/ --db opencode.db
 
 ## sift-records v2：文件归因证据
 
-Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 导出为一个结构化 JSON，再直接作为 `--transcript` 输入。顶层 `format` 仍是 `sift-records`，因此旧 reader 可以识别；`version: 2` 启用文件证据校验和 lineage 透传。
+Opsbot 或其他 producer 可以将完整 session 事件与文件归因 capture 导出为一个结构化 JSON，再直接作为 `--transcript` 输入。当前实现提供 v2 reader、blob 校验、capture 归一化和 `SessionDigest` 证据保存；现有 Judge、`AuditFinding` 和 audit 报告尚未将文件 effect 作为新的判定维度。顶层 `format` 仍是 `sift-records`，因此旧 reader 可以识别；`version: 2` 启用文件证据校验和 lineage 透传。
 
 ### 顶层字段
 
@@ -495,7 +495,7 @@ sift audit path/to/agent.md \
   --kind agent --turn-refs -o audit-output
 ```
 
-`--kind`、多 transcript 聚合、coverage、boundary 和现有报告参数均保持不变。文件归因是审计辅助证据：它可以支撑“谁修改了哪个路径、最终可信状态由哪次 capture 产生”等事实，但不能单独证明完整 workflow 已执行，也不会把“未声明工具”自动判成违规。
+`--kind`、多 transcript 聚合、coverage、boundary 和现有报告参数均保持不变。当前文件归因只是 digest 层的辅助证据，可供后续 FILE_EFFECT/Judge/report 功能使用；它尚未自动支撑“谁修改了哪个路径、最终可信状态由哪次 capture 产生”等 audit verdict，也不会把“未声明工具”自动判成违规。
 
 ### `trigger` — 触发准确度（第 4 维）
 

@@ -217,21 +217,22 @@ sift audit path/to/skill/ --db opencode.db                            # 直接�
 
 > `--max-concurrent N`（或 env `SIFT_MAX_CONCURRENT`）：**固定** LLM 判定并发上限（关自适应）；不设则默认 **AIMD 自适应**（动态探后端容量边界，适配不同模型/服务商）。env `SIFT_ADAPTIVE_CONCURRENCY=0` 显式关自适应。大声明 / 低内存时用 `--max-concurrent` 调小。
 
-#### Opsbot 文件归因证据（`sift-records` v2）
+#### Opsbot 文件归因证据（`sift-records` v2，基础能力）
 
-Opsbot 可以把 session 事件和文件归因 capture 导出为一个 `sift-records` v2 JSON。它是审计的证据原件，不是另一套审计命令：Sift 会先把它展开成内部 canonical JSONL，再复用现有的切片、digest、Judge 和报告流程。
+当前 PR 提供的是 Sift 侧的证据读取和中间层基础能力，还不是完整的“结合文件归因进行审计”功能。Sift 可以读取 Opsbot 导出的 `sift-records` v2 JSON，校验并保存 capture、blob 和文件 effect；但现有 Judge、`AuditFinding` 和 audit 报告暂未消费这些 effect，当前审计 verdict 仍只依据既有 transcript/tool trace。
 
 ```bash
+# 当前可用于验证 v2 输入能被 reader/digest 接收；不表示已启用文件 effect 判定
 sift audit path/to/agent.md \
   --transcript opsbot-audit-<session>.json \
-  --kind agent --turn-refs -o audit-output
+  --kind agent -o audit-output
 ```
 
 v2 顶层至少包含 `format: "sift-records"`、`version: 2`、`session`、`records`、`captures`、`blobs`、`coverage` 和 `warnings`。`records[].tool_calls[]` 保留原生 tool ID、时间、结果和 `capture_id`；`captures` 保存 actor/agent lineage、工具状态和文件 effects；`blobs` 只保存 mutation 涉及文件的 before/after 内容，并按 SHA-256 去重。完整字段定义见 [参考手册的 v2 协议](docs/sift-reference.md#sift-records-v2文件归因证据)。
 
-文件 effect 的 `quality` 分为 `observed`、`incomplete`、`conflicted`、`ambiguous`。只有 `observed` effect 可以用于确定性重建最终文件；其余 effect 仍会显示在证据链中，但不会覆盖可信状态，并会进入 warnings / unreconstructed。没有文件 mutation 的 capture 也会保留，表示工具执行过但没有产生文件变化。
+文件 effect 的 `quality` 分为 `observed`、`incomplete`、`conflicted`、`ambiguous`。reader 会保留这些质量信息，并将可信度传入 `SessionDigest`；只有后续接入文件 effect 判定后，`observed` 才能用于确定性重建最终文件。输入包损坏、blob 缺失或 SHA-256 不匹配时，Sift 会拒绝整个输入。v1 structured records、Claude Code JSONL 和 OpenCode session JSON 继续使用原有入口。
 
-输入包损坏、blob 缺失或 SHA-256 不匹配时，Sift 会拒绝整个输入，不生成部分可信报告。v1 structured records、Claude Code JSONL 和 OpenCode session JSON 继续使用原有入口；Opsbot exporter/API 不属于 Sift reader 的职责。
+完整的 FILE_EFFECT scene、evidence refs、Judge 约束和报告展示属于后续 PR；Opsbot exporter/API 也不属于 Sift reader 的职责。
 
 ### `trigger` — 触发准确度（第 4 维）
 
