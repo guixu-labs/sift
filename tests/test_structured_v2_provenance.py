@@ -9,6 +9,7 @@ import json
 import pytest
 
 from sift.audit.slice import slice_transcript
+from sift.audit.rebuild import rebuild
 from sift.errors import InputError
 from sift.evals.structured import load_structured_records
 from sift.evals.transcript import _digest_from_records
@@ -226,6 +227,35 @@ def test_v2_rejects_unknown_version_missing_blob_and_bad_hash(tmp_path):
         load_structured_records(_write(tmp_path, corrupt))
 
 
+@pytest.mark.parametrize("version", [pytest.param(..., id="missing"), None, "1", 1])
+def test_v1_version_spellings_keep_legacy_loader_path(tmp_path, version):
+    data = {
+        "format": "sift-records",
+        "records": [{
+            "role": "assistant",
+            "tool_calls": [{"name": "read", "input": {"file_path": "x.py"}}],
+        }],
+    }
+    if version is not ...:
+        data["version"] = version
+    records = load_structured_records(_write(tmp_path, data))
+    assert records[0]["message"]["content"][0]["id"] == "tu_1"
+
+
+def test_v2_non_object_tool_input_is_a_clean_input_error(tmp_path):
+    data = _bundle()
+    data["records"][0]["tool_calls"][0]["input"] = ["not", "an", "object"]
+    with pytest.raises(InputError, match="tool call input 必须是对象"):
+        load_structured_records(_write(tmp_path, data))
+
+
+def test_v2_model_type_error_is_a_clean_input_error_during_load(tmp_path):
+    data = _bundle()
+    data["captures"]["cap-b"]["effects"][0]["additions"] = "one"
+    with pytest.raises(InputError, match="文件 effect 字段类型无效"):
+        load_structured_records(_write(tmp_path, data))
+
+
 def test_v2_preserves_binary_blob_metadata_without_decoding_as_text(tmp_path):
     data = _bundle()
     binary_hash, binary_blob = _blob(b"\x00\xff", binary=True)
@@ -250,6 +280,27 @@ def test_v2_preserves_binary_blob_metadata_without_decoding_as_text(tmp_path):
     assert effect.after_binary is True
     assert effect.after_content is None
     assert effect.after_size == 2
+
+
+def test_provenance_paths_do_not_change_existing_root_inference(tmp_path):
+    data = _bundle()
+    data["captures"]["cap-b"]["effects"][0]["path"] = "/outside/evidence/foo.txt"
+    digest = _digest_from_records(load_structured_records(_write(tmp_path, data)))
+    assert [item.path for item in digest.produced_files] == ["foo.txt"]
+
+
+def test_standalone_capture_is_usable_when_records_are_empty(tmp_path):
+    data = _bundle()
+    data["records"] = []
+    data["captures"] = {"cap-a": data["captures"]["cap-a"]}
+    records = load_structured_records(_write(tmp_path, data))
+    jsonl = tmp_path / "expanded.jsonl"
+    jsonl.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
+        encoding="utf-8",
+    )
+    _, _, digest = rebuild(jsonl)
+    assert [event.capture_id for event in digest.provenance_timeline] == ["cap-a"]
 
 
 def test_v1_output_has_no_v2_metadata(tmp_path):
@@ -285,4 +336,5 @@ def test_slice_propagates_v2_metadata_without_assigning_unmatched_to_skill(tmp_p
     segments = slice_transcript(jsonl, "demo", "skill")
     assert len(segments) == 1
     assert segments[0][0]["_sift_bundle_meta"]["version"] == 2
+    assert "unmatched_captures" not in segments[0][0]["_sift_bundle_meta"]
     assert all("_sift_standalone_capture" not in record for record in segments[0])

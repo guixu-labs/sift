@@ -50,10 +50,17 @@ def rebuild(
     else:
         digest = build_digest(transcript_path, locate_turns=locate_turns)
 
-    # digest 全空:无 user turn / 无文件 / 无工具调用 → 此 transcript 无可对账内容。
+    # digest 全空:无 user turn / 无文件 / 无工具调用 / provenance evidence
+    # → 此 transcript 无可对账内容。v2 可能只有 unmatched capture；它虽
+    # 没有 tool_use，却是可审计的证据时间线，不能被误判为空 transcript。
     # 常见于理解类题(L1):cc 纯推理作答、不走工具/不读写文件,遵循性审的是流程执行,
     # 无流程可审 → 判 N/A,不是失败(避免误读成"遵循性挂了")。
-    if not digest.user_turns and not digest.manifest and not digest.tool_trace:
+    if (
+        not digest.user_turns
+        and not digest.manifest
+        and not digest.tool_trace
+        and not digest.provenance_timeline
+    ):
         raise SiftError(
             "此 transcript 无可对账内容:无工具调用 / 文件产出"
             "(cc 纯推理作答,常见于理解类题,遵循性无流程可审 —— 非失败)"

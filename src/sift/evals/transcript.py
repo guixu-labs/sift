@@ -34,8 +34,9 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from sift.errors import InputError
 from sift.models import FileEffectRecord, ProvenanceEvent, ToolCallRecord
 
 _LINE_NUM_RE = re.compile(r"^\s*\d+\t", re.MULTILINE)
@@ -265,61 +266,72 @@ def _digest_from_records(
         for raw_effect in raw_capture.get("effects") or []:
             if not isinstance(raw_effect, dict) or not raw_effect.get("path"):
                 continue
-            effect = FileEffectRecord.model_validate({
-                **raw_effect,
-                "evidence_ref": raw_effect.get("evidence_ref")
-                    or f"capture:{capture_id}:{raw_effect['path']}",
-                "quality": raw_capture.get("quality"),
-                "capture_id": capture_id,
-                "actor": raw_capture.get("actor") or raw_capture.get("agent") or rec.get("agent") or "",
-                "tool_name": raw_capture.get("tool_name") or "",
-            })
+            try:
+                effect = FileEffectRecord.model_validate({
+                    **raw_effect,
+                    "evidence_ref": raw_effect.get("evidence_ref")
+                        or f"capture:{capture_id}:{raw_effect['path']}",
+                    "quality": raw_capture.get("quality"),
+                    "capture_id": capture_id,
+                    "actor": raw_capture.get("actor")
+                        or rec.get("agent")
+                        or "",
+                    "tool_name": raw_capture.get("tool_name") or "",
+                })
+            except ValidationError as exc:
+                raise InputError(
+                    f"provenance capture {capture_id} 的文件 effect 字段类型无效: {exc}"
+                ) from exc
             effects.append(effect)
             evidence_refs[effect.evidence_ref] = effect
-            remember(effect.path)
 
-        event = ProvenanceEvent.model_validate({
-            "timestamp": raw_capture.get("started_at") or tool_timestamp or rec.get("timestamp"),
-            "record_timestamp": rec.get("timestamp"),
-            "tool_timestamp": tool_timestamp,
-            "started_at": raw_capture.get("started_at"),
-            "finished_at": raw_capture.get("finished_at"),
-            "event_id": rec.get("event_id"),
-            "capture_id": capture_id,
-            "tool_use_id": raw_capture.get("tool_use_id") or tool_use_id,
-            "association_quality": raw_capture.get("association_quality") or "unmatched",
-            "quality": raw_capture.get("quality"),
-            "actor_kind": raw_capture.get("actor_kind"),
-            "agent": raw_capture.get("agent") or rec.get("agent"),
-            "parent_agent": raw_capture.get("parent_agent") or rec.get("parent_agent"),
-            "native_agent_id": raw_capture.get("native_agent_id"),
-            "iteration": rec.get("iteration") if rec.get("iteration") is not None
-                else raw_capture.get("iteration"),
-            "parent_tool_use_id": raw_capture.get("parent_tool_use_id")
-                or rec.get("parent_tool_use_id"),
-            "session_id": raw_capture.get("session_id") or rec.get("session_id"),
-            "native_session_id": raw_capture.get("native_session_id")
-                or rec.get("native_session_id"),
-            "parent_native_session_id": raw_capture.get("parent_native_session_id")
-                or rec.get("parent_native_session_id"),
-            "tool_name": raw_capture.get("tool_name"),
-            "tool_input": raw_capture.get("tool_input"),
-            "tool_output": raw_capture.get("tool_output"),
-            "runtime": raw_capture.get("runtime"),
-            "model": raw_capture.get("model"),
-            "succeeded": raw_capture.get("succeeded"),
-            "is_error": raw_capture.get("is_error"),
-            "incomplete": raw_capture.get("incomplete", False),
-            "conflicted": raw_capture.get("conflicted", False),
-            "conflicts": raw_capture.get("conflicts") or [],
-            "mutation_reasons": raw_capture.get("mutation_reasons") or [],
-            "cwd": raw_capture.get("cwd"),
-            "head_before": raw_capture.get("head_before"),
-            "head_after": raw_capture.get("head_after"),
-            "committed_sha": raw_capture.get("committed_sha"),
-            "attributes": raw_capture.get("attributes") or {},
-            "effects": effects,
-        })
+        try:
+            event = ProvenanceEvent.model_validate({
+                "timestamp": raw_capture.get("started_at") or tool_timestamp or rec.get("timestamp"),
+                "record_timestamp": rec.get("timestamp"),
+                "tool_timestamp": tool_timestamp,
+                "started_at": raw_capture.get("started_at"),
+                "finished_at": raw_capture.get("finished_at"),
+                "event_id": rec.get("event_id"),
+                "capture_id": capture_id,
+                "tool_use_id": raw_capture.get("tool_use_id") or tool_use_id,
+                "association_quality": raw_capture.get("association_quality") or "unmatched",
+                "quality": raw_capture.get("quality"),
+                "actor_kind": raw_capture.get("actor_kind"),
+                "agent": raw_capture.get("agent") or rec.get("agent"),
+                "parent_agent": raw_capture.get("parent_agent") or rec.get("parent_agent"),
+                "native_agent_id": raw_capture.get("native_agent_id"),
+                "iteration": rec.get("iteration") if rec.get("iteration") is not None
+                    else raw_capture.get("iteration"),
+                "parent_tool_use_id": raw_capture.get("parent_tool_use_id")
+                    or rec.get("parent_tool_use_id"),
+                "session_id": raw_capture.get("session_id") or rec.get("session_id"),
+                "native_session_id": raw_capture.get("native_session_id")
+                    or rec.get("native_session_id"),
+                "parent_native_session_id": raw_capture.get("parent_native_session_id")
+                    or rec.get("parent_native_session_id"),
+                "tool_name": raw_capture.get("tool_name"),
+                "tool_input": raw_capture.get("tool_input"),
+                "tool_output": raw_capture.get("tool_output"),
+                "runtime": raw_capture.get("runtime"),
+                "model": raw_capture.get("model"),
+                "succeeded": raw_capture.get("succeeded"),
+                "is_error": raw_capture.get("is_error"),
+                "incomplete": raw_capture.get("incomplete", False),
+                "conflicted": raw_capture.get("conflicted", False),
+                "conflicts": raw_capture.get("conflicts") or [],
+                "mutation_reasons": raw_capture.get("mutation_reasons") or [],
+                "cwd": raw_capture.get("cwd"),
+                "head_before": raw_capture.get("head_before"),
+                "head_after": raw_capture.get("head_after"),
+                "committed_sha": raw_capture.get("committed_sha"),
+                "attributes": raw_capture.get("attributes") or {},
+                "effects": effects,
+            })
+        except ValidationError as exc:
+            raise InputError(
+                f"provenance capture {capture_id} 字段类型无效: {exc}"
+            ) from exc
         provenance_by_capture.setdefault(capture_id, event)
         return provenance_by_capture[capture_id]
 
@@ -392,38 +404,45 @@ def _digest_from_records(
             # Glob/Grep/WebSearch 等会被忽略。tool_trace 必须收全部,
             # audit 的工具指令对账才能按任意工具名匹配。turn=所属 record 的全局 _turn_index
             # (locate_turns=False 时置 None——turn 定位特性可选化,no-seq 形态不标 turn)。
-            tool_trace.append(ToolCallRecord(
-                name=name,
-                input_summary=json.dumps(b.get("input") or {}, ensure_ascii=False)[:200],
-                input=inp or None,  # 完整结构化参数(不截断),供参数级匹配/路径规范化;inp 见上(line 274)
-                turn=turn_idx if locate_turns else None,
-                tool_use_id=str(tid) if structured_v2 and tid else None,
-                timestamp=b.get("_sift_timestamp"),
-                record_timestamp=rec.get("timestamp"),
-                event_id=rec.get("event_id"),
-                iteration=rec.get("iteration"),
-                result=b.get("_sift_result"),
-                is_error=b.get("_sift_is_error") if b.get("_sift_is_error") is not None
-                    else event.is_error if event else None,
-                capture_id=event.capture_id if event else None,
-                evidence_quality=event.quality if event else None,
-                association_quality=event.association_quality if event else None,
-                evidence_refs=[effect.evidence_ref for effect in event.effects] if event else [],
-                agent=rec.get("agent") or (event.agent if event else None),
-                parent_agent=rec.get("parent_agent") or (event.parent_agent if event else None),
-                parent_tool_use_id=rec.get("parent_tool_use_id")
-                    or (event.parent_tool_use_id if event else None),
-                session_id=rec.get("session_id") or (event.session_id if event else None),
-                native_session_id=rec.get("native_session_id")
-                    or (event.native_session_id if event else None),
-                parent_native_session_id=rec.get("parent_native_session_id")
-                    or (event.parent_native_session_id if event else None),
-                runtime=event.runtime if event else None,
-                model=event.model if event else None,
-                started_at=event.started_at if event else None,
-                finished_at=event.finished_at if event else None,
-                succeeded=event.succeeded if event else None,
-            ))
+            try:
+                tool_trace.append(ToolCallRecord(
+                    name=name,
+                    input_summary=json.dumps(b.get("input") or {}, ensure_ascii=False)[:200],
+                    input=inp or None,  # 完整结构化参数(不截断),供参数级匹配/路径规范化;inp 见上(line 274)
+                    turn=turn_idx if locate_turns else None,
+                    tool_use_id=str(tid) if structured_v2 and tid else None,
+                    timestamp=b.get("_sift_timestamp"),
+                    record_timestamp=rec.get("timestamp"),
+                    event_id=rec.get("event_id"),
+                    iteration=rec.get("iteration"),
+                    result=b.get("_sift_result"),
+                    is_error=b.get("_sift_is_error") if b.get("_sift_is_error") is not None
+                        else event.is_error if event else None,
+                    capture_id=event.capture_id if event else None,
+                    evidence_quality=event.quality if event else None,
+                    association_quality=event.association_quality if event else None,
+                    evidence_refs=[effect.evidence_ref for effect in event.effects] if event else [],
+                    agent=rec.get("agent") or (event.agent if event else None),
+                    parent_agent=rec.get("parent_agent") or (event.parent_agent if event else None),
+                    parent_tool_use_id=rec.get("parent_tool_use_id")
+                        or (event.parent_tool_use_id if event else None),
+                    session_id=rec.get("session_id") or (event.session_id if event else None),
+                    native_session_id=rec.get("native_session_id")
+                        or (event.native_session_id if event else None),
+                    parent_native_session_id=rec.get("parent_native_session_id")
+                        or (event.parent_native_session_id if event else None),
+                    runtime=event.runtime if event else None,
+                    model=event.model if event else None,
+                    started_at=event.started_at if event else None,
+                    finished_at=event.finished_at if event else None,
+                    succeeded=event.succeeded if event else None,
+                ))
+            except ValidationError as exc:
+                # Keep cc/opencode's historical failure behavior untouched;
+                # only v2 provenance input uses the clean InputError channel.
+                if not structured_v2:
+                    raise
+                raise InputError(f"tool call {tid} 字段类型无效: {exc}") from exc
             if name == "Skill":
                 if not skill_used:
                     skill_used = inp.get("skill") or inp.get("name")

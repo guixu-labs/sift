@@ -74,6 +74,16 @@ from sift.models.execution_models import (
     ScoringConfig,
     ToolCallRecord,
 )
+from sift.models.sift_records_v2 import (
+    SiftRecordsV2,
+    SiftRecordsV2Blob,
+    SiftRecordsV2Capture,
+    SiftRecordsV2FileEffect,
+    SiftRecordsV2NativeSession,
+    SiftRecordsV2Record,
+    SiftRecordsV2Session,
+    SiftRecordsV2ToolCall,
+)
 from sift.models.grading_models import (
     Claim,
     EvalFeedback,
@@ -140,6 +150,14 @@ __all__ = [
     "ToolCallRecord",
     "FileEffectRecord",
     "ProvenanceEvent",
+    "SiftRecordsV2",
+    "SiftRecordsV2Blob",
+    "SiftRecordsV2Capture",
+    "SiftRecordsV2FileEffect",
+    "SiftRecordsV2NativeSession",
+    "SiftRecordsV2Record",
+    "SiftRecordsV2Session",
+    "SiftRecordsV2ToolCall",
     # Benchmark models
     "AnalysisReport",
     "AnomalyReport",
