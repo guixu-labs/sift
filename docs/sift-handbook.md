@@ -1867,6 +1867,8 @@ Opsbot 负责将文件归因证据输出为对应的 JSON 文件，Sift 侧负�
 
 把 Opsbot 提供的文件归因证据（`sift-records` v2）带入现有审计流程，内部模型分成三层：
 
+原始 v2 bundle 在 reader 边界先解析为 `SiftRecordsV2` 及其嵌套 BaseModel。BaseModel 负责协议字段的严格类型校验和跨对象完整性校验；生成 canonical cc-record 之前不会将 v2 证据整体降回普通字典。
+
 | 模型 | 作用 | 关键内容 |
 |---|---|---|
 | `ToolCallRecord` | 现有工具轨迹的扩展 | 原生 tool ID、工具输入/结果、状态、时间、capture ID、agent/session lineage、evidence refs |
@@ -1875,10 +1877,10 @@ Opsbot 负责将文件归因证据输出为对应的 JSON 文件，Sift 侧负�
 
 #### 关键步骤
 
-1. `load_structured_records()` 按 `version` 处理：省略版本或 `version=1` 进入原有 v1 loader；`version=2` 进入 provenance loader
-2. v2 loader 先校验 `records`、`captures`、`blobs` 的类型，再解码 blob。UTF-8 内容按文本保存，base64 内容按二进制标记；每个 blob 都重新计算 SHA-256，并校验文件 size，任意 blob 损坏都会拒绝整个输入。
-3. reader 统计每个 `capture_id` 被 tool call 引用的次数，并检查 effect 引用的 blob 是否存在。唯一引用得到 `association_quality=exact`；多次引用或 capture 自身为 `ambiguous` 得到 `ambiguous`；零次引用得到 `unmatched`。
-4. 转换为现有 canonical record：assistant/user 文本进入 `message.content`，工具调用进入 `tool_use` 块，工具结果进入 `tool_result`。
+1. `load_structured_records()` 按 `version` 分派：缺省、`null`、整数 `1` 和字符串 `"1"` 都进入原有 v1 loader；只有真正的整数 `2` 进入 v2 loader。
+2. v2 loader 调用 `SiftRecordsV2.model_validate()`。模型负责 `records`、`captures`、`blobs` 及嵌套字段的严格类型校验，并在 model validator 中检查 capture/blob 引用、capture key 一致性、base64 解码、SHA-256 和 size；失败统一转换为 `InputError`，不生成部分可信输入。
+3. loader 从 bundle session 构建一次 `session_agents`，显式传给 `_build_v2_context()`。context 在已验证的 BaseModel 上计算关联质量：唯一引用为 `association_quality=exact`；多次引用或 capture 自身为 `ambiguous` 为 `ambiguous`；零次引用为 `unmatched`。
+4. 在 canonical record 之前，records、captures、effects 和 blobs 仍是 BaseModel。只有写入现有 canonical record 时才 `model_dump()`：assistant/user 文本进入 `message.content`，工具调用进入 `tool_use`，工具结果进入 `tool_result`，关联 capture 进入 `_sift_evidence`，unmatched capture 进入 standalone record。
 5. `SessionDigest` 会继续填充原有 `user_turns`、`input_files`、`produced_files`、`commands` 和 `transcript_text`，并额外保存 `evidence_refs`、`evidence_warnings`、`evidence_metadata`、`provenance_timeline`。因此 **v1 和普通 session 的字段和判定行为不变**，v2 只是增加可供后续 analyzer/Judge/report 使用的证据。
 
 ```text

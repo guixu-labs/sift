@@ -452,7 +452,7 @@ Opsbot 可以将完整 session 事件与文件归因 capture 导出为一个结�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `format` | string | 固定为 `sift-records` |
-| `version` | integer | `2`；省略时按 v1 处理 |
+| `version` | integer / string / null | 真正的整数 `2` 表示 v2；缺省、`null`、整数 `1` 或字符串 `"1"` 按 v1 处理 |
 | `producer` | string | 证据包生产方，例如 `opsbot-file-provenance` |
 | `exported_at` | string | 导出时间 |
 | `session` | object | session ID、native session 和父子 lineage 等元数据 |
@@ -462,13 +462,19 @@ Opsbot 可以将完整 session 事件与文件归因 capture 导出为一个结�
 | `coverage` | object | producer 已知的证据覆盖情况 |
 | `warnings` | array | producer 或 reader 需要人工关注的缺口 |
 
+#### BaseModel 校验边界
+
+Sift 只在 v2 分支调用 `SiftRecordsV2.model_validate()`。`SiftRecordsV2` 及其嵌套模型使用严格类型，不会把字符串数字或布尔值隐式转换为整数。模型 validator 同时校验 capture key、tool call 的 capture 引用、effect 的 blob 引用、base64 内容、SHA-256 和 size。校验失败会转换为统一的 `InputError`，整个 bundle 被拒绝。
+
+v1 不经过这些模型，也不改变原有 `_load_v1_records()` 的行为。v2 在 canonical record 之前继续以 BaseModel 作为主表示；仅在把证据挂到既有 canonical cc-record 的 `_sift_evidence` 或 standalone capture 时转换为字典。
+
 #### capture、effect 和 blob 规则
 
-- `records[].tool_calls[]` 可以携带原生 `id`、`timestamp`、`result`、`is_error` 和 `capture_id`。Sift 会保留这些信息，不为 v2 工具调用重建虚假的关联 ID。
+- `records[].tool_calls[]` 可以携带原生 `id`、`timestamp`、`result`、`is_error` 和 `capture_id`。提供原生 `id` 时 Sift 原样保留；缺失时生成的 `tu_<n>` 只是 canonical 管线内部的临时 ID，不声称是 producer 的原生 ID。
 - `captures[capture_id]` 保存 actor、agent、runtime/model、工具生命周期、父子 session lineage 和 `effects`。即使没有 mutation，capture 也必须保留，表示工具执行过但没有产生文件变化。
 - `effects[]` 至少包含 `path`；可以提供 `before_blob`、`after_blob`、`additions`、`deletions` 和 `conflict`。文件证据引用采用 `capture:<capture_id>:<path>`。
 - `blobs` 只包含 mutation 涉及文件的完整 before/after 字节，不是整个 worktree 快照。`encoding` 为 `utf-8` 时保存文本，为 `base64` 时保存二进制。
-- Sift 会校验 blob 的 SHA-256 和 size，以及 effect 对 blob 的引用。缺失引用、损坏内容或 hash 不匹配会使整个输入失败，不生成部分可信报告。
+- `SiftRecordsV2` 会校验 blob 的 SHA-256 和 size，以及 effect 对 blob 的引用。缺失引用、损坏内容或 hash 不匹配会使整个输入失败，不生成部分可信报告。
 
 `captures[].quality` 只接受以下四种值：
 
@@ -478,6 +484,8 @@ Opsbot 可以将完整 session 事件与文件归因 capture 导出为一个结�
 | `incomplete` | 生命周期或 before/after 证据不完整 | 保留证据，但不覆盖可信状态 |
 | `conflicted` | 存在重叠、冲突或跨 commit 情况 | 保留证据，但不覆盖可信状态 |
 | `ambiguous` | 无法唯一归属到工具调用 | 保留为 standalone capture，不伪造 tool call |
+
+`quality` 描述 capture 本身的证据完整性，`association_quality` 描述它与主轨迹 tool call 的关联结果；两者是独立字段。只有 `quality=observed` 且关联可用时，后续确定性分析才可以把 effect 当作可信文件事实。
 
 一个 capture 被多个 tool call 引用时，或 capture 自身为 `ambiguous`，reader 会将其关联质量标记为 `ambiguous`。完全没有 tool call 引用的 capture 标记为 `unmatched`，仍会写入 canonical record 的 `_sift_standalone_capture` 字段，供 loose/root/agent 审计查看；Skill 切片不会把它归给附近的 Skill 调用。
 
