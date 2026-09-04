@@ -84,6 +84,11 @@ from sift.models.sift_records_v2 import (
     SiftRecordsV2Session,
     SiftRecordsV2ToolCall,
 )
+from sift.models.provenance_audit_models import (
+    ProvenanceAuditResult,
+    ProvenanceFinding,
+    ProvenanceTimelineEntry,
+)
 from sift.models.grading_models import (
     Claim,
     EvalFeedback,
@@ -158,6 +163,9 @@ __all__ = [
     "SiftRecordsV2Record",
     "SiftRecordsV2Session",
     "SiftRecordsV2ToolCall",
+    "ProvenanceFinding",
+    "ProvenanceAuditResult",
+    "ProvenanceTimelineEntry",
     # Benchmark models
     "AnalysisReport",
     "AnomalyReport",
