@@ -20,7 +20,7 @@ def _effect(capture: str, path: str, *, quality: str = "observed", after: str | 
     )
 
 
-def _event(capture: str, *, at: str, tool: str = "Write", agent: str = "developer",
+def _event(capture: str, *, at: str | None, tool: str = "Write", agent: str = "developer",
            quality: str = "observed", association: str = "exact", effects=None,
            is_error: bool | None = False, succeeded: bool | None = True,
            tool_id: str | None = None):
@@ -88,6 +88,48 @@ def test_trusted_and_untrusted_effects_partition_all_effects():
         result.statistics["trusted_effect_count"]
         + result.statistics["untrusted_effect_count"]
     )
+
+
+def test_evidence_health_covers_all_quality_and_reference_findings():
+    unmatched = _event(
+        "unmatched", at="2026-09-01T10:00:00Z", association="unmatched",
+        effects=[_effect("unmatched", "src/unmatched.py")],
+    )
+    ambiguous = _event(
+        "ambiguous", at="2026-09-01T10:01:00Z", quality="ambiguous",
+        effects=[_effect("ambiguous", "src/ambiguous.py", quality="ambiguous")],
+    )
+    conflicted = _event(
+        "conflicted", at="2026-09-01T10:02:00Z", quality="conflicted",
+        effects=[_effect("conflicted", "src/conflicted.py", quality="conflicted")],
+    )
+    conflicted.conflicted = True
+    incomplete = _event(
+        "incomplete", at="2026-09-01T10:03:00Z", quality="incomplete",
+        effects=[_effect("incomplete", "src/incomplete.py", quality="incomplete")],
+    )
+    untrusted_effect_event = _event(
+        "untrusted-effect", at="2026-09-01T10:04:00Z",
+        effects=[_effect("untrusted-effect", "src/untrusted.py", quality="incomplete")],
+    )
+    missing_call = ToolCallRecord(
+        name="Write", capture_id="missing", tool_use_id="missing-tool", turn=7,
+    )
+    digest = _digest(
+        [unmatched, ambiguous, conflicted, incomplete, untrusted_effect_event],
+        calls=[missing_call],
+        evidence_warnings=["capture 覆盖不完整"],
+        unreconstructed=["src/unknown.py"],
+    )
+    result = analyze_provenance(digest)
+    codes = {finding.code for finding in result.findings}
+    untrusted_result = analyze_provenance(_digest([untrusted_effect_event]))
+    codes.update(finding.code for finding in untrusted_result.findings)
+    assert {
+        "EVIDENCE_WARNINGS", "UNMATCHED_CAPTURE", "MISSING_CAPTURE_EVENT",
+        "AMBIGUOUS_CAPTURE", "CONFLICTED_CAPTURE", "INCOMPLETE_CAPTURE",
+        "UNTRUSTED_EFFECT", "UNRECONSTRUCTED_FILE",
+    } <= codes
 
 
 def test_attribution_integrity_detects_error_and_read_mutation_and_empty_write():
@@ -171,3 +213,36 @@ def test_markdown_changes_are_exempt_from_post_change_test_requirement():
     change = _event("docs", at="2026-09-01T10:00:00Z", effects=[_effect("docs", "README.md")])
     result = analyze_provenance(_digest([change]))
     assert not any(f.code == "FINAL_MODIFICATION_UNVERIFIED" for f in result.findings)
+
+
+def test_invalid_timestamp_events_are_kept_for_health_but_excluded_from_state_reasoning():
+    change = _event("z-write", at=None, effects=[_effect("z-write", "src/a.py")])
+    test_event = _event("a-test", at=None, tool="Bash", effects=[])
+    test_event.tool_input = {"command": "pytest -q"}
+    calls = [
+        ToolCallRecord(name="Bash", input={"command": "pytest -q"}, capture_id="a-test"),
+    ]
+    result = analyze_provenance(_digest([change, test_event], calls))
+    codes = {finding.code for finding in result.findings}
+    assert result.statistics["effect_count"] == 1
+    assert result.statistics["trusted_effect_count"] == 1
+    assert "src/a.py" in result.file_timelines
+    assert "src/a.py" not in result.statistics.get("final_writers", {})
+    assert "VERIFICATION_ORDER_UNKNOWN" not in codes
+    assert "FINAL_MODIFICATION_UNVERIFIED" not in codes
+
+
+def test_bash_heuristics_ignore_stream_redirection_and_commit_message():
+    change = _event("change", at="2026-09-01T10:00:00Z", effects=[_effect("change", "src/a.py")])
+    grep_event = _event("grep", at="2026-09-01T10:01:00Z", tool="Bash", effects=[])
+    grep_event.tool_input = {"command": "grep foo bar.txt 2>&1"}
+    commit_event = _event("commit", at="2026-09-01T10:02:00Z", tool="Bash", effects=[])
+    commit_event.tool_input = {"command": 'git commit -m "test"'}
+    calls = [
+        ToolCallRecord(name="Bash", input=grep_event.tool_input, capture_id="grep", succeeded=True),
+        ToolCallRecord(name="Bash", input=commit_event.tool_input, capture_id="commit", succeeded=True),
+    ]
+    result = analyze_provenance(_digest([change, grep_event, commit_event], calls))
+    codes = {finding.code for finding in result.findings}
+    assert "WRITE_WITHOUT_EFFECT" not in codes
+    assert "FINAL_MODIFICATION_UNVERIFIED" in codes

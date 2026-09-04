@@ -1,16 +1,15 @@
-"""Deterministic analysis of file-provenance evidence.
+"""文件归因证据的确定性分析。
 
-The analyser consumes an already reconstructed :class:`SessionDigest`.  It
-does not call an LLM and it never changes the existing instruction-audit
-findings.  A v2 bundle is considered available even when it contains no file
-effects, because an empty capture is useful evidence that a tool ran without a
-mutation.
+分析器消费已经重建的 :class:`SessionDigest`，不调用 LLM，也不会修改既有的
+指令审计 finding。即使 v2 证据包没有文件变更，仍视为可用，因为“工具执行但
+没有 mutation”本身也是有价值的证据。
 """
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+import re
 from typing import Iterable
 
 from sift.evals.transcript import SessionDigest
@@ -29,32 +28,55 @@ _READ_TOOLS = {
     "read", "glob", "grep", "search", "websearch", "list", "ls", "cat",
     "find", "stat", "head", "tail", "pwd",
 }
-_BASH_MUTATION_MARKERS = (
-    ">", "tee ", "sed -i", "perl -i", "cp ", "mv ", "rm ", "mkdir ",
-    "touch ", "truncate ", "git apply", "apply_patch",
+_BASH_MUTATION_COMMANDS = {
+    "cp", "mv", "rm", "mkdir", "touch", "truncate", "apply_patch",
+}
+_BASH_TEST_PATTERNS = (
+    re.compile(r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:python(?:\d+(?:\.\d+)?)?\s+-m\s+)?(?:pytest|tox|nose|unittest)(?:\s|$)"),
+    re.compile(r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:npm|yarn|pnpm|make|cargo|go|mix|mvn|gradle)\s+[^;&|]*\btest(?:s)?\b"),
 )
+_BASH_REDIRECT_RE = re.compile(r"(?:^|[\s;|])(?:\d+)?>{1,2}\s*([^\s;&|]+)")
+_TEST_TOOL_NAME_RE = re.compile(r"(?:^|[_-])tests?(?:$|[_-])")
 _PROVENANCE_SCHEMA_VERSION = 2
-_TIME_VALID = 0
-_TIME_MALFORMED = 1
-_TIME_MISSING = 2
 _VERIFICATION_EXEMPT_SUFFIXES = {".md", ".markdown", ".mdx"}
 
 
-def _parse_time_key(value: str | None) -> tuple[int, float, str]:
-    """Return a total ordering key; malformed timestamps remain deterministic."""
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """解析时间戳；缺失或畸形值返回 ``None``。"""
     if not value:
-        return (_TIME_MISSING, 0.0, "")
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return (_TIME_VALID, parsed.timestamp(), "")
+        return parsed
     except (TypeError, ValueError):
-        return (_TIME_MALFORMED, 0.0, str(value))
+        return None
 
 
-def _build_event_key(event: ProvenanceEvent) -> tuple[int, float, str, str]:
-    return (*_parse_time_key(event.timestamp), event.event_id or event.capture_id)
+def _collect_events_with_valid_timestamps(
+    events: Iterable[ProvenanceEvent],
+) -> list[ProvenanceEvent]:
+    """收集并按合法时间戳排序的事件。
+
+    无效时间戳事件不会参与文件状态或验证闭环推理；同一时间戳下保留
+    原始 sequence 和输入顺序，避免把 capture ID 当作时间依据。
+    """
+    timed_events: list[tuple[datetime, int, int, ProvenanceEvent]] = []
+    for index, event in enumerate(events):
+        timestamp = _parse_timestamp(event.timestamp)
+        if timestamp is not None:
+            timed_events.append((timestamp, event.sequence, index, event))
+    timed_events.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [event for _, _, _, event in timed_events]
+
+
+def _get_valid_timestamp(event: ProvenanceEvent) -> datetime:
+    """获取已筛选事件的合法时间戳。"""
+    timestamp = _parse_timestamp(event.timestamp)
+    if timestamp is None:
+        raise ValueError("event does not contain a valid timestamp")
+    return timestamp
 
 
 def _normalize_tool_name(name: str | None) -> str:
@@ -63,37 +85,64 @@ def _normalize_tool_name(name: str | None) -> str:
 
 def _is_test_call(call: ToolCallRecord, name: str | None = None) -> bool:
     normalized_name = name if name is not None else _normalize_tool_name(call.name)
-    if "test" in normalized_name or normalized_name in {"pytest", "tox", "unittest", "check"}:
+    if normalized_name in {"pytest", "tox", "unittest", "check"} or _TEST_TOOL_NAME_RE.search(normalized_name):
         return True
     if normalized_name in {"bash", "shell", "terminal", "exec", "run"}:
         command = str((call.input or {}).get("command", "")).lower()
-        return any(token in command for token in ("pytest", "unittest", " tox", " test", "make test"))
+        return any(pattern.search(command) for pattern in _BASH_TEST_PATTERNS)
+    return False
+
+
+def _contains_bash_mutation(command: str) -> bool:
+    """仅识别明确的 Bash 变更命令，忽略 2>&1 和 /dev/null 等重定向。"""
+    for match in _BASH_REDIRECT_RE.finditer(command):
+        target = match.group(1)
+        if target.startswith("&") or target.startswith("/dev/"):
+            continue
+        return True
+    for segment in re.split(r"[;&|]+", command):
+        words = segment.strip().split()
+        if not words:
+            continue
+        executable = words[0].rsplit("/", 1)[-1]
+        if executable == "tee":
+            targets = [word for word in words[1:] if not word.startswith("-")]
+            if any(not target.startswith("/dev/") for target in targets):
+                return True
+        if executable in _BASH_MUTATION_COMMANDS:
+            return True
+        if executable == "sed" and "-i" in words:
+            return True
+        if executable == "perl" and any(word.startswith("-i") for word in words):
+            return True
+        if executable == "git" and len(words) > 1 and words[1] == "apply":
+            return True
     return False
 
 
 def _is_write_call(event: ProvenanceEvent, name: str | None = None) -> bool:
-    """Recognise a call that claims to write, without treating every Bash as one."""
+    """识别明确声明写入的工具调用，不把普通 Bash 一律视为写入。"""
     normalized_name = name if name is not None else _normalize_tool_name(event.tool_name)
     if normalized_name in {"write", "edit", "multiedit", "apply_patch", "patch"}:
         return True
     if normalized_name == "bash":
         command = str((event.tool_input or {}).get("command", "")).lower()
-        return any(marker in command for marker in _BASH_MUTATION_MARKERS)
+        return _contains_bash_mutation(command)
     return False
 
 
 def _is_event_failed(event: ProvenanceEvent) -> bool:
-    """Treat an explicit error or unsuccessful status as a failed call."""
+    """将明确错误或明确失败状态视为调用失败。"""
     return event.is_error is True or event.succeeded is False
 
 
 def _is_event_successful(event: ProvenanceEvent) -> bool:
-    """Require an explicit success and reject contradictory error flags."""
+    """只有明确成功且没有错误标记时才视为调用成功。"""
     return event.succeeded is True and event.is_error is not True
 
 
 def _requires_verification(path: str) -> bool:
-    """Return whether a changed path normally needs a post-change test."""
+    """判断变更路径通常是否需要修改后的测试。"""
     normalized_path = path.lower()
     return not any(normalized_path.endswith(suffix) for suffix in _VERIFICATION_EXEMPT_SUFFIXES)
 
@@ -103,7 +152,7 @@ def _deduplicate_values(values: Iterable[str]) -> list[str]:
 
 
 def _deduplicate_events(events: Iterable[ProvenanceEvent]) -> list[ProvenanceEvent]:
-    """Deduplicate events while preserving timeline order."""
+    """去重事件，同时保留时间线顺序。"""
     seen: set[str] = set()
     result: list[ProvenanceEvent] = []
     for event in events:
@@ -115,7 +164,7 @@ def _deduplicate_events(events: Iterable[ProvenanceEvent]) -> list[ProvenanceEve
 
 
 def _is_trusted_effect(event: ProvenanceEvent, effect: FileEffectRecord) -> bool:
-    """Whether an effect is strong enough to participate in state reasoning."""
+    """判断 effect 是否足够可信，可以参与文件状态推理。"""
     return (
         event.quality == "observed"
         and event.association_quality == "exact"
@@ -152,7 +201,7 @@ def _build_finding(
     evidence_refs: Iterable[str] = (),
     effects: Iterable[FileEffectRecord] | None = None,
 ) -> ProvenanceFinding:
-    """Build a finding, optionally reusing already flattened effect records."""
+    """构造 finding；必要时复用已经展开的 effect 记录。"""
     events = list(events)
     effect_records = (
         list(effects) if effects is not None else _flatten_effects(events)
@@ -216,35 +265,43 @@ def _build_timeline_summary(
 
 
 def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
-    """Analyse evidence health and execution behaviour without an LLM."""
+    """在不调用 LLM 的前提下分析证据健康度和执行行为。"""
     metadata = digest.evidence_metadata or {}
     has_provenance_data = bool(digest.provenance_timeline or digest.evidence_refs)
     available = metadata.get("version") == _PROVENANCE_SCHEMA_VERSION or has_provenance_data
     if not available:
         return ProvenanceAuditResult(available=False)
 
-    events = sorted(digest.provenance_timeline, key=_build_event_key)
+    # 全部事件用于证据健康检查；只有带合法时间戳的事件参与状态推理。
+    all_events = list(digest.provenance_timeline)
+    timed_events = _collect_events_with_valid_timestamps(all_events)
     calls_by_capture: dict[str, list[ToolCallRecord]] = defaultdict(list)
     for call in digest.tool_trace:
         if call.capture_id:
             calls_by_capture[call.capture_id].append(call)
 
-    quality_counts = Counter(event.quality for event in events)
-    association_counts = Counter(event.association_quality for event in events)
+    quality_counts = Counter(event.quality for event in all_events)
+    association_counts = Counter(event.association_quality for event in all_events)
     effects: list[FileEffectRecord] = []
     trusted_effects: list[tuple[ProvenanceEvent, FileEffectRecord]] = []
     untrusted_effects: list[tuple[ProvenanceEvent, FileEffectRecord]] = []
-    for event in events:
+    for event in all_events:
         for effect in event.effects:
             effects.append(effect)
             target = trusted_effects if _is_trusted_effect(event, effect) else untrusted_effects
             target.append((event, effect))
+    timed_trusted_effects = [
+        (event, effect)
+        for event in timed_events
+        for effect in event.effects
+        if _is_trusted_effect(event, effect)
+    ]
     findings: list[ProvenanceFinding] = []
     warnings = _deduplicate_values(digest.evidence_warnings)
 
-    # Evidence health -----------------------------------------------------
+    # 证据健康度 ----------------------------------------------------------
     stats = {
-        "capture_count": len(events),
+        "capture_count": len(all_events),
         "effect_count": len(effects),
         "trusted_effect_count": len(trusted_effects),
         "untrusted_effect_count": len(untrusted_effects),
@@ -254,7 +311,7 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
         "trusted_file_count": len({effect.path for _, effect in trusted_effects}),
         "actor_count": len({
             event.agent or event.actor_kind
-            for event in events
+            for event in all_events
             if event.agent or event.actor_kind
         }),
         "unreconstructed_count": len(digest.unreconstructed),
@@ -264,13 +321,13 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
         findings.append(_build_finding(
             dimension="evidence_health", severity="warning", code="EVIDENCE_WARNINGS",
             summary=f"证据包含 {len(warnings)} 条覆盖或质量警告",
-            explanation="; ".join(warnings), events=events, effects=effects,
+            explanation="; ".join(warnings), events=all_events, effects=effects,
         ))
     unmatched: list[ProvenanceEvent] = []
     ambiguous: list[ProvenanceEvent] = []
     conflicted: list[ProvenanceEvent] = []
     incomplete: list[ProvenanceEvent] = []
-    for event in events:
+    for event in all_events:
         if event.association_quality == "unmatched":
             unmatched.append(event)
         if event.association_quality == "ambiguous" or event.quality == "ambiguous":
@@ -286,7 +343,7 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
             explanation="这些 capture 会保留在时间线中，但不能证明具体对应哪一次工具调用。",
             events=unmatched, turn_refs=_collect_event_turns(unmatched, calls_by_capture),
         ))
-    event_capture_ids = {event.capture_id for event in events}
+    event_capture_ids = {event.capture_id for event in all_events}
     missing_capture_calls = [
         call for call in digest.tool_trace
         if call.capture_id and call.capture_id not in event_capture_ids
@@ -339,8 +396,8 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
             paths=digest.unreconstructed,
         ))
 
-    # Attribution integrity ----------------------------------------------
-    for event in events:
+    # 归因完整性 ----------------------------------------------------------
+    for event in all_events:
         name = _normalize_tool_name(event.tool_name)
         linked_calls = calls_by_capture.get(event.capture_id, [])
         mismatched_calls = [
@@ -381,9 +438,9 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
                 events=[event], turn_refs=_collect_event_turns([event], calls_by_capture),
             ))
 
-    # File churn and ownership -------------------------------------------
+    # 文件变更与执行者归属 ------------------------------------------------
     by_path: dict[str, list[tuple[ProvenanceEvent, FileEffectRecord]]] = defaultdict(list)
-    for event, effect in trusted_effects:
+    for event, effect in timed_trusted_effects:
         by_path[effect.path].append((event, effect))
     for path, entries in by_path.items():
         if len(entries) > 1:
@@ -451,22 +508,23 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
                     events=[event], paths=[path], turn_refs=_collect_event_turns([event], calls_by_capture),
                 ))
 
-    # Verification closure -----------------------------------------------
+    # 验证闭环 ------------------------------------------------------------
     test_calls = [
         call for call in digest.tool_trace
         if _is_test_call(call, _normalize_tool_name(call.name))
     ]
     test_events = [
-        event for event in events
+        event for event in timed_events
         if any(call.capture_id == event.capture_id for call in test_calls)
     ]
     for path, entries in by_path.items():
         if not _requires_verification(path):
             continue
         last_event, _ = entries[-1]
+        last_timestamp = _get_valid_timestamp(last_event)
         post_tests = [
             event for event in test_events
-            if _build_event_key(event) > _build_event_key(last_event)
+            if _get_valid_timestamp(event) > last_timestamp
         ]
         if not post_tests:
             findings.append(_build_finding(
@@ -486,6 +544,6 @@ def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
         coverage=coverage,
         statistics=stats,
         findings=findings,
-        file_timelines=_build_timeline_summary(events),
+        file_timelines=_build_timeline_summary(all_events),
         warnings=warnings,
     )
