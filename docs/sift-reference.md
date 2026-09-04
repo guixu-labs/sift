@@ -530,6 +530,8 @@ Analyzer 只消费已校验的 `SessionDigest`，不调用 LLM，也不修改既
 
 `ProvenanceAuditResult` 是 `analyze_provenance(digest)` 的返回值。它只描述文件归因分析结果，不替代 `AuditReport`。
 
+`AuditReport.provenance` 是一个按 transcript 文件名索引的对象，值为对应的 `ProvenanceAuditResult`。`TranscriptAuditor.audit()` 会自动填充其中可用的 v2 结果；普通 v1/session 不写入条目。该字段只作为独立报告区块，不参与既有 findings、coverage、PASS/FAIL 汇总或 exit code。
+
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `available` | boolean | `false` | 是否存在可供分析的 v2 provenance 证据；普通 v1/session 为 `false` |
