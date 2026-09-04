@@ -219,7 +219,7 @@ sift audit path/to/skill/ --db opencode.db                            # 直接�
 
 #### Opsbot 文件归因证据审计
 
-Sift 可以读取 Opsbot 导出的 `sift-records` v2 JSON，校验并保存 capture、blob 和文件 effect；但现有 Judge、`AuditFinding` 和 audit 报告暂未消费这些 effect，当前审计 verdict 仍只依据既有 transcript/tool trace。
+Sift 可以读取 Opsbot 导出的 `sift-records` v2 JSON，校验并保存 capture、blob 和文件 effect。确定性 `analyze_provenance(digest)` API 已提供 evidence health、attribution integrity、file churn、actor ownership 和 verification closure 五个维度；它返回独立的 `ProvenanceAuditResult`，不写入 `AuditFinding`，也不改变现有 Judge、coverage、exit code 或声明 PASS/FAIL。当前 CLI 仍只展示既有 transcript 审计结果，后续阶段再把该结果接入报告。
 
 ```bash
 sift audit path/to/agent.md \
