@@ -498,6 +498,82 @@ CLI 检测到 `sift-records` JSON 后，调用 `load_structured_records()` 将�
 - 关联 capture 放在工具块的 `_sift_evidence`，standalone capture 放在 `_sift_standalone_capture`；
 - `SessionDigest` 保存 `evidence_refs`、`evidence_warnings`、`evidence_metadata` 和 `provenance_timeline`，同时继续填充原有 `tool_trace`、`input_files`、`produced_files`。
 
+### 确定性 Provenance Analyzer
+
+```python
+from sift.audit.provenance import analyze_provenance
+
+result = analyze_provenance(digest)
+```
+
+Analyzer 只消费已校验的 `SessionDigest`，不调用 LLM，也不修改既有声明审计结果；字段和取值以以下模型定义为准。
+
+#### `ProvenanceFinding`
+
+`ProvenanceFinding` 描述一条确定性文件归因观察，不属于 Markdown 声明的 `AuditFinding`，不会计入声明 coverage 或改变原有 PASS/FAIL。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `dimension` | string | 必填 | 分析维度：`evidence_health`、`attribution_integrity`、`file_churn`、`actor_ownership`、`verification_closure` |
+| `severity` | string | 必填 | `info` 表示行为事实或诊断信息；`warning` 表示已确认的风险提示；`indeterminate` 表示证据不足、冲突或归因不确定，不能给出确定结论 |
+| `code` | string | 必填 | 稳定的机器可读 finding 代码，例如 `UNMATCHED_CAPTURE`、`FINAL_MODIFICATION_UNVERIFIED` |
+| `summary` | string | 必填 | 面向人的简短结论 |
+| `explanation` | string | `""` | 规则触发原因和限制说明 |
+| `paths` | array[string] | `[]` | 涉及的文件路径 |
+| `actors` | array[string] | `[]` | 涉及的 actor/agent |
+| `capture_ids` | array[string] | `[]` | 相关 provenance capture ID |
+| `tool_use_ids` | array[string] | `[]` | 相关原生工具调用 ID |
+| `evidence_refs` | array[string] | `[]` | 文件证据引用，格式通常为 `capture:<capture_id>:<path>` |
+| `turn_refs` | array[integer] | `[]` | 能定位到的 transcript turn；无 turn 定位时为空 |
+
+#### `ProvenanceAuditResult`
+
+`ProvenanceAuditResult` 是 `analyze_provenance(digest)` 的返回值。它只描述文件归因分析结果，不替代 `AuditReport`。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `available` | boolean | `false` | 是否存在可供分析的 v2 provenance 证据；普通 v1/session 为 `false` |
+| `coverage` | dict | `{}` | producer 提供的覆盖信息和缺口 |
+| `statistics` | dict | `{}` | capture/effect 数量、quality/association 分布、可信 effect、涉及文件和最终写入者等统计 |
+| `findings` | array[`ProvenanceFinding`] | `[]` | 独立的行为 finding 列表 |
+| `file_timelines` | object<string, array[`ProvenanceTimelineEntry`]> | `{}` | 按路径组织的 effect 时间线摘要；节点包含 sequence、timestamp、capture、actor、quality、hash 和 trusted 状态，不复制完整 blob |
+| `warnings` | array[string] | `[]` | 输入证据覆盖或分析过程中的警告 |
+
+`available=true` 不代表所有文件 effect 都可信。可信文件状态必须同时满足 capture 和 effect `quality=observed`、`association_quality=exact` 且不存在 capture/effect conflict；其他 effect 会保留在 `file_timelines` 中，但不能覆盖可信状态，并可能产生 `warning` 或 `indeterminate` finding。
+
+#### Analyzer 判定规则
+
+`analyze_provenance()` 按以下顺序执行确定性规则：
+
+1. **可用性**：`evidence_metadata.version == 2`，或 `provenance_timeline` / `evidence_refs` 至少一个非空时，`available=true`。因此 v2 的空 capture 仍然可分析；没有 provenance 证据的普通 session 返回 `available=false`。
+2. **可信分区**：每个 `(capture, effect)` 只分类一次。可信 effect 必须同时满足 capture 和 effect 的 `quality=observed`、`association_quality=exact`，且 capture/effect 没有冲突；其余 effect 进入 untrusted 分区。所有 effect 都会保留在时间线中，但只有 trusted effect 参与最终文件状态、churn 和 ownership 判断。
+3. **Evidence Health**：分别统计 unmatched、ambiguous、conflicted、incomplete capture；检查工具轨迹引用了但时间线缺失的 capture；合并输入 warnings 和无法重建的路径。证据不足或冲突使用 `indeterminate`，覆盖缺口和不完整生命周期使用 `warning`。
+4. **Attribution Integrity**：检查 capture 与工具轨迹的工具 ID/名称是否一致；错误或明确失败的工具产生文件变更时报告 `ERROR_WITH_MUTATION`；只读工具产生变更时报告 `NON_WRITE_MUTATION`；明确成功的写工具没有 effect 时报告 `WRITE_WITHOUT_EFFECT`。
+5. **File Churn / Actor Ownership**：只对 trusted effect 按路径排序，识别重复修改、恢复旧内容哈希和完整覆盖。多执行者修改同一路径本身不产生 finding；只有 producer 明确给出与前一执行者不一致的 `parent_agent` 时才报告 lineage 问题，缺少 actor 信息时报告 `LINEAGE_GAP`。
+6. **Verification Closure**：对通常需要测试的代码文件，检查最终可信修改之后是否存在测试工具调用。`.md`、`.markdown`、`.mdx` 默认豁免；没有后续测试时报告 `FINAL_MODIFICATION_UNVERIFIED`。`is_error` 表示结果错误标记，`succeeded` 表示明确成功；两者矛盾时错误标记优先。测试失败后继续修改本身是正常修复流程，不单独产生 finding。
+
+事件按有效时间戳、异常时间戳、缺失时间戳的优先级排序；同一优先级下使用解析后的时间和 event/capture ID 作为稳定顺序，因此分析结果可重复。
+
+#### `ProvenanceTimelineEntry`
+
+`file_timelines` 的每个列表元素都是 `ProvenanceTimelineEntry`。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `sequence` | integer | `0` | provenance 时间线中的稳定顺序 |
+| `timestamp` | string/null | `null` | capture 开始或关联工具事件时间 |
+| `capture_id` | string | 必填 | 归因 capture 标识 |
+| `tool_use_id` | string/null | `null` | 关联的原生工具调用 ID |
+| `actor` | string | `""` | 执行 actor/agent |
+| `tool_name` | string | `""` | 产生 effect 的工具 |
+| `quality` | string | 必填 | `observed`、`incomplete`、`conflicted` 或 `ambiguous` |
+| `association_quality` | string | 必填 | `exact`、`ambiguous` 或 `unmatched` |
+| `trusted` | boolean | `false` | 是否满足可信文件状态条件 |
+| `evidence_ref` | string | 必填 | 通常为 `capture:<capture_id>:<path>` |
+| `before_blob` / `after_blob` | string/null | `null` | before/after 内容 hash 引用 |
+| `additions` / `deletions` | integer | `0` | 文件增删统计 |
+| `conflict` | boolean | `false` | 该 effect 是否存在冲突 |
+
 ### `trigger` — 触发准确度（第 4 维）
 
 测 cc 会不会**仅凭 skill 的 `description` 自然调用本 skill**——不评输出对错、只看触发。前三层（scoring / compliance / calibration）都默认 skill 已"上场"：scoring 的 `_build_non_interactive_prompt` 把 skill body 强制注入 cc prompt + "Follow its instructions" → cc 对"要不要够这个 skill"没得选，**触发能力从不被测**。一个永不触发的 skill，body 再好也是死重量；trigger-accuracy 补的就是这个上游缺口。

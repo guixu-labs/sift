@@ -1856,9 +1856,9 @@ Opsbot 负责将文件归因证据输出为对应的 JSON 文件，Sift 侧负�
 
 | 阶段 | 交付内容 | 当前状态 |
 |---|---|---|
-| 1. 内部证据模型 | v2 reader、blob 校验、capture/effect 归一化、lineage 透传、digest timeline | 当前 PR |
-| 2. 确定性 Analyzer | evidence health、attribution integrity、file churn、actor ownership、verification closure | 后续 PR |
-| 3. 独立 Finding | `ProvenanceFinding` / `ProvenanceAuditResult` 与 `AuditFinding` 分离 | 后续 PR |
+| 1. 内部证据模型 | v2 reader、blob 校验、capture/effect 归一化、lineage 透传、digest timeline | 已合入 |
+| 2. 确定性 Analyzer | evidence health、attribution integrity、file churn、actor ownership、verification closure | 当前 PR |
+| 3. 独立 Finding | `ProvenanceFinding` / `ProvenanceAuditResult` 与 `AuditFinding` 分离 | 当前 PR |
 | 4. audit 使用 | v2 自动运行 analyzer；v1/session 保持原行为 | 后续 PR |
 | 5. 报告展示 | Provenance Overview、Behavior Findings、File Timeline | 后续 PR |
 | 6. 语义审计 | 受限 LLM 检查最终回答、变更完整性和替代路径 | 单独评估（TODO） |
@@ -1902,33 +1902,17 @@ _digest_from_records()
 
 | 维度 | 检查内容 | 默认输出 |
 |---|---|---|
-| Evidence Health | quality 分布、缺失/损坏引用、unmatched、coverage warnings、无法重建文件 | `INFO/WARNING` |
-| Attribution Integrity | 写工具无 effect、错误工具产生 mutation、非写工具产生 mutation、轨迹字段不一致 | `WARNING/INDETERMINATE` |
-| File Churn | 重复修改、恢复旧 hash、后续完全覆盖、多 Agent 交替写入 | `INFO/WARNING` |
-| Actor Ownership | 每个路径的 actor、最终写入者、无交接跨 actor 写入、lineage 断裂 | `INFO/WARNING` |
-| Verification Closure | 修改后测试、测试失败后再次修改、最终修改未验证 | `WARNING/INDETERMINATE` |
+| Evidence Health | quality 分布、unmatched/ambiguous/conflicted/incomplete、缺失 capture、coverage warnings、无法重建文件 | `WARNING/INDETERMINATE` |
+| Attribution Integrity | 写工具无文件变更、错误或失败工具产生变更、只读工具产生变更、轨迹字段不一致 | `WARNING/INDETERMINATE` |
+| File Churn | trusted effect 的重复修改、恢复旧内容哈希、完整覆盖 | `INFO/WARNING` |
+| Actor Ownership | 每个路径的执行者、最终写入者、明确不一致的 parent lineage、执行者信息缺失 | `WARNING` |
+| Verification Closure | 最终修改后的测试证据、最终修改未验证 | `WARNING` |
 
-#### 独立 Provenance Finding
+验证闭环只针对通常需要执行测试的代码文件；`.md`、`.markdown` 和 `.mdx` 文档默认视为验证豁免路径，不会因为没有测试调用而产生 `FINAL_MODIFICATION_UNVERIFIED`。工具的 `is_error` 表示结果是否被标记为错误，`succeeded` 表示是否明确报告成功；两者同时存在时，错误标记优先，只有 `succeeded=true` 且 `is_error` 不是 `true` 才视为成功。
 
-不复用 `AuditFinding`，以免污染声明覆盖率或改变现有 pass/fail 数量。规划字段为：
+实现位于 `src/sift/audit/provenance.py`，结果数据模型位于 `src/sift/models/provenance_audit_models.py`。Analyzer 目前作为独立 API 使用，尚未接入 CLI 报告；因此调用它不会改变既有 audit 的 exit code、声明 coverage 或 PASS/FAIL 数量。对普通 v1/cc/opencode session，返回 `available=false`；对 v2 即使没有 mutation，也返回 `available=true`，因为“工具执行但没有文件变化”本身是可审计事实。
 
-```python
-ProvenanceFinding(
-    dimension="verification_closure",
-    severity="warning",
-    code="MODIFIED_AFTER_TEST",
-    summary="测试后又修改了 src/foo.py",
-    explanation="最后一次可信修改发生在测试之后，未发现后续验证。",
-    paths=["src/foo.py"],
-    actors=["developer"],
-    capture_ids=["cap-21"],
-    tool_use_ids=["tool-21"],
-    evidence_refs=["capture:cap-21:src/foo.py"],
-    turn_refs=[25],
-)
-```
-
-`ProvenanceAuditResult` 保存 `available`、coverage、statistics、findings 和 per-file `file_timelines`，v1 或普通 session 返回 `available=false`，不产生行为 finding。
+独立 Provenance Finding 不复用 `AuditFinding`，以免污染声明覆盖率或改变现有 pass/fail 数量；`ProvenanceAuditResult.file_timelines` 使用 `ProvenanceTimelineEntry` 表示每次文件 effect。完整类型、默认值和取值约定见 [reference 中的字段定义](sift-reference.md#provenancefinding)。
 
 #### audit 使用
 
