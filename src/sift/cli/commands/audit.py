@@ -359,8 +359,10 @@ def audit(
                 aux_tool_traces = []
             for tp, ti, i, seg, is_oc in segs:
                 if aux_tool_traces is not None:
+                    # locate_turns 透传:与主 trace 同体系——报告关闭 [T{idx}] 渲染时
+                    # aux 命中的 evidence 也不带 (T{n}) 引用,免得出现无锚点可对的序号。
                     aux_tool_traces.append(
-                        [] if is_oc else build_subagent_tool_trace(tp)
+                        [] if is_oc else build_subagent_tool_trace(tp, locate_turns=locate_turns)
                     )
                 ext = ".json" if is_oc else ".jsonl"
                 sp = slice_dir / f"{tp.stem}-{name}-{ti}-{i}{ext}"

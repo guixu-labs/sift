@@ -185,3 +185,36 @@ def test_kind_root_opencode_missing_info_agent_exits_2(monkeypatch, tmp_path):
     assert r.exit_code == 2
     assert "info.agent" in r.output
     assert len(fake.calls) == 0                      # 没喂 auditor(提前退出)
+
+
+def test_kind_root_aux_locate_turns_passthrough(monkeypatch, tmp_path):
+    """评审修复:build_subagent_tool_trace 的 locate_turns 随 CLI 透传——
+    默认 --no-turn-refs 时 aux 记录 turn=None(与主 trace 同体系,evidence 不带
+    无锚点可对的 (T{n}) 引用);--turn-refs 时带全局 turnIndex。"""
+
+    def _run(tag, extra):
+        fake = _FakeAuditor()
+        monkeypatch.setattr("sift.cli.commands.audit.TranscriptAuditor", lambda: fake)
+        work = tmp_path / tag                   # 两次调用各用独立子目录
+        work.mkdir()
+        sp = _skill_dir(work, "wf")
+        a_id = "call_A"
+        records = [
+            _asst("MAIN_TXT"),
+            _agent(a_id),
+            _in_sub(a_id, _tool_use("s1", "Bash", {"command": "pytest -q"})),
+            _tool_result(a_id, "ok"),
+        ]
+        tp = _write_jsonl(work / "s.jsonl", records)
+        out = work / "out"
+        r = runner.invoke(app, ["audit", str(sp), "--transcript", str(tp),
+                                "--kind", "root", "-o", str(out)] + extra)
+        assert r.exit_code == 0, r.output
+        aux = fake.calls[0]["aux_tool_traces"]
+        assert aux is not None and len(aux) == 1 and len(aux[0]) == 1
+        return aux[0][0]
+
+    rec_default = _run("default", [])      # 默认 --no-turn-refs
+    assert rec_default.turn is None        # aux 与主 trace 一致:不带 turn 引用
+    rec_turnrefs = _run("turnrefs", ["--turn-refs"])
+    assert rec_turnrefs.turn is not None   # 开启时带全局 turnIndex

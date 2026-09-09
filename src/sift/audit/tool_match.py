@@ -267,8 +267,10 @@ def find_tool_call(tool_name: str, script_path: str, tool_trace, required_params
     """返回 tool_trace 里**首条**命中判定的 tool call(与 ``match_tool_call`` 完全同判据);
     无命中 → None。
 
-    消费方:A1 旁路匹配(auditor._judge_conditional 第二遍)需要命中的**那条记录**做
-    evidence 归属(子代理角色/turn),bool 不够用。判据细节见 ``match_tool_call``。
+    消费方:``match_tool_call`` 的重构(判据单一来源,bool 版只是 ``is not None``)。
+    注意 A1 旁路(aux 子代理痕迹,auditor._judge_conditional 第二遍)**不走**本函数
+    ——旁路要"子代理做没做过"的严格判据,用 ``find_execution_hit``。判据细节见
+    ``match_tool_call``。
     """
     if not tool_trace:
         return None

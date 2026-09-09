@@ -252,19 +252,6 @@ def _slice_root(records: list[dict]) -> list[list[dict]]:
     return [root_recs] if root_recs else []
 
 
-def slice_subagents(transcript_path: Path) -> list[list[dict]]:
-    """kind=root 的镜像切法:子代理作用域全部 record(parent_tool_use_id 非空)。
-
-    root 切片按设计排除子代理(审主 agent 编排纪律),但 STATE.md 的执行类步骤(跑命令/
-    写文件/加载 skill)在编排范式下**全部由子代理执行**,主 scope 工具痕迹恒为 0 →
-    条件类存在性判定(TOOL_REQUIREMENT/REFERENCE_USAGE)"缺席式"误判(A1)。
-    本函数返回被 root 切片排除的那半边,供 ``build_subagent_tool_trace`` 构建 aux 痕迹。
-    """
-    records = _records(transcript_path)
-    sub_recs = [r for r in records if _scope_of(r) is not None]
-    return [sub_recs] if sub_recs else []
-
-
 def build_subagent_tool_trace(transcript_path: Path, *, locate_turns: bool = True) -> list[ToolCallRecord]:
     """A1 旁路证据源:子代理作用域全部工具调用(root 判定的"缺席≠未发生"洗冤通道)。
 

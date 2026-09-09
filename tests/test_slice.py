@@ -508,6 +508,23 @@ def test_dispatch_pairs_section_render_and_truncate():
     assert "省略" in sec2 or "另有" in sec2           # 压缩标记存在
     assert sec2.count("[T1") >= 1
 
+    # 评审修复①:失败判定只看回报窗口——prompt 含「失败」但回报成功的长文本派发
+    # (修 bug 工作流常态)不算失败行,不绕过预算 → 封顶不被打破(评审实测旧版
+    # 100 条此形态派发可把段落撑到 19295 字符,超限 2.4 倍)。
+    bugfix = [_p("developer", f"修复失败的用例 {i} " * 10, "全部通过 " * 30, dt=i, rt=i + 1)
+              for i in range(100)]
+    sec3 = _dispatch_pairs_section(bugfix)
+    assert "回报含失败字样 0 份" in sec3              # prompt 的「失败」不计入
+    assert len(sec3) <= _DISPATCH_PAIRS_LIMIT + 600  # 封顶守住
+
+    # 评审修复②:失败行也守预算——超量失败回报压「另有 M 份」计数,不无条件全留
+    failed_many = [_p("verifier", f"验收 Task {i}", f"FAILED: 用例 {i} 超阈值 " * 20,
+                      dt=i, rt=i + 1) for i in range(60)]
+    sec4 = _dispatch_pairs_section(failed_many)
+    assert len(sec4) <= _DISPATCH_PAIRS_LIMIT + 600  # 封顶是不变式
+    assert "份含失败字样的回报未展开" in sec4         # 超预算失败行压计数
+    assert "FAILED: 用例 0 超阈值" in sec4           # 预算内失败行仍在(优先保留)
+
     # 空 → 空段(整段不进 prompt)
     assert _dispatch_pairs_section(None) == ""
     assert _dispatch_pairs_section([]) == ""

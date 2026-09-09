@@ -71,7 +71,6 @@ from sift.audit.tool_match import (
     count_tool_calls,
     extract_first_balanced,
     find_execution_hit,
-    find_tool_call,
     load_json_lenient,
     match_tool_call,
 )
@@ -179,8 +178,11 @@ def _dispatch_pairs_section(pairs, aux_tool_trace=None) -> str:
       层1 已构建;无 aux 时缺省执行计数)——直接杀"全程没有任何实际运行测试"式断言。
     - 每对一行:``[T派发→T回报] 角色「prompt 头」 → 回报: 回报头``。回报头显式标注
       **子代理产出**——回报是子代理的报告,不是主 agent 的行为(防判官张冠李戴)。
-    - 裁剪(超 _DISPATCH_PAIRS_LIMIT):先压 trivial 回报(<20 字,如 DONE/空)成计数行;
-      仍超 → 保留含失败字样的行 + 首尾若干,中段标省略数。空 pairs → ""(段整体不进)。
+    - 裁剪(超 _DISPATCH_PAIRS_LIMIT,封顶是不变式——该段随每批 prompt 重复进
+      step/prohibition 两判官,超限 token 成本按批次数放大):失败行(只按**回报窗口**
+      判定,不含 prompt——修 bug 类工作流的派发 prompt 常含「失败」二字)优先占预算,
+      超预算的压「另有 M 份」计数;trivial 回报(<20 字,如 DONE/空)压计数行;
+      其余按余量收,中段标省略数。空 pairs → ""(段整体不进)。
     """
     if not pairs:
         return ""
@@ -218,33 +220,49 @@ def _dispatch_pairs_section(pairs, aux_tool_trace=None) -> str:
         role = _f(p, "role") or "子代理"
         return f"- {rng} {role}「{ph[:80]}」 → 回报(子代理产出): {shown}"
 
-    def _is_failed(l):
-        return any(m in l for m in ("FAILED", "失败", "❌"))
+    def _is_failed(p):
+        # 只看回报窗口(result_head/result_tail)——修 bug 类工作流的派发 prompt 常含
+        # 「失败」二字(如「修复失败的用例 N」),prompt 命中 ≠ 回报失败。
+        rh = str(_f(p, "result_head") or "")
+        rt = str(_f(p, "result_tail") or "")
+        return any(m in rh or m in rt for m in ("FAILED", "失败", "❌"))
 
     lines = [_fmt(p) for p in pairs]
-    n_failed = sum(1 for l in lines if _is_failed(l))
+    n_failed = sum(1 for p in pairs if _is_failed(p))
     stats = (f"统计:派发 {len(pairs)} 次({role_str}){exec_str};"
              f"回报含失败字样 {n_failed} 份")
 
     body = "\n".join(lines)
     if len(body) + len(stats) > _DISPATCH_PAIRS_LIMIT:
-        # 保序单遍:失败行全留(先占预算);trivial(回报<20字)压计数;其余按余量收
+        # 两遍收行,守 8KB 封顶不变量:
+        # ① 失败行优先占预算(验收结论是 W1 门禁的关键证据)——但也受预算约束,
+        #   超出的压「另有 M 份」计数行,不无条件全留;
+        # ② 其余行:trivial(回报<20字)压计数,余者按余量收,中段标省略数。
         budget = _DISPATCH_PAIRS_LIMIT - len(stats) - 300  # 300 = 段头+压缩标记余量
+        keep = [False] * len(pairs)
+        for i, (p, l) in enumerate(zip(pairs, lines)):
+            if _is_failed(p) and budget > len(l) + 1:
+                keep[i] = True
+                budget -= len(l) + 1
         kept: list[str] = []
         n_trivial = 0
-        for p, l in zip(pairs, lines):
-            if _is_failed(l):
+        for i, (p, l) in enumerate(zip(pairs, lines)):
+            if keep[i]:
                 kept.append(l)
-                budget -= len(l) + 1
+            elif _is_failed(p):
+                pass  # 失败但超预算 → 压计数(下方 n_failed_dropped)
             elif len(str(_f(p, "result_head"))) < 20:
                 n_trivial += 1
             elif budget > 0:
                 kept.append(l)
                 budget -= len(l) + 1
-        dropped = len(lines) - len(kept) - n_trivial
+        n_failed_dropped = n_failed - sum(keep)
+        dropped = len(lines) - len(kept) - n_trivial - n_failed_dropped
         parts = kept
         if dropped > 0:
             parts.append(f"…(中段省略 {dropped} 条派发)")
+        if n_failed_dropped > 0:
+            parts.append(f"(另有 {n_failed_dropped} 份含失败字样的回报未展开)")
         if n_trivial > 0:
             parts.append(f"(另有 {n_trivial} 次派发回报为 DONE/空等短文本)")
         body = "\n".join(parts)
@@ -830,7 +848,7 @@ class TranscriptAuditor:
                 # 默认开)。digest.dispatch_returns 由 rebuild 从切片里的 task/Agent
                 # tool_use + tool_result 配对收集(insight 侧已透传 dispatch result;
                 # cc 原生 jsonl 天生就有)。step 判官默认喂;prohibition 判官经
-                # SIFT_PROHIBITION_PAIRS=1 共享(层3-改进3,默认关)。aux 复用层1 的
+                # SIFT_PROHIBITION_PAIRS 共享(层3-改进3,默认开,=0 可关)。aux 复用层1 的
                 # 子代理痕迹做执行统计行。
                 _pairs = (
                     digest.dispatch_returns
