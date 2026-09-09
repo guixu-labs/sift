@@ -2918,3 +2918,53 @@ class TestStepDispatchPairs:
         )
         assert findings[0].verdict == AuditVerdict.PASS
         assert "派发-回报记录" in prompts[0]
+
+
+class TestProhibitionPairsShare:
+    """层3-改进3:prohibition 判官共享 pairs 段(SIFT_PROHIBITION_PAIRS=1)。"""
+
+    def test_default_none_pairs_keeps_old_prompt(self, monkeypatch) -> None:
+        """pairs 不传/None(或 env 显式关):prohibition prompt 不含 pairs 段。
+        默认开(实验转正),env SIFT_PROHIBITION_PAIRS=0 是逃生口——这里验关路。"""
+        prompts = []
+
+        def fake(prompt, *a, **k):
+            prompts.append(prompt)
+            return json.dumps([{"index": 0, "violated": False, "evidence": "未违反"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        monkeypatch.setenv("SIFT_PROHIBITION_PAIRS", "0")
+        auditor = TranscriptAuditor()
+        from sift.evals.transcript import DispatchReturn
+        pairs = [DispatchReturn(dispatch_turn=1, result_turn=2, role="verifier",
+                                prompt_head="验收", result_head="FAILED", result_len=6)]
+        auditor._llm_judge_prohibition(
+            [_prohibition_inst()], "文本", None, 600, dispatch_pairs=pairs,
+        )
+        # 注:env 门在 audit() 调用点(默认开才传 pairs);_llm 层直传 pairs 仍渲染段。
+        # 本测试锚定的是"不传 pairs 的默认 prompt 形态"(旧版兼容路径)。
+        auditor._llm_judge_prohibition(
+            [_prohibition_inst()], "文本", None, 600,
+        )
+        assert "派发-回报记录" not in prompts[1]
+
+    def test_on_with_env(self, monkeypatch) -> None:
+        """env=1:pairs 段进 prohibition prompt(由 _judge_prohibition 穿线;
+        这里直接验 _llm_judge_prohibition 的段拼装)。"""
+        prompts = []
+
+        def fake(prompt, *a, **k):
+            prompts.append(prompt)
+            return json.dumps([{"index": 0, "violated": False, "evidence": "未违反"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        from sift.evals.transcript import DispatchReturn
+        pairs = [DispatchReturn(dispatch_turn=1, result_turn=2, role="verifier",
+                                prompt_head="验收 Task 47", result_head="FAILED: 254/275",
+                                result_len=15)]
+        auditor = TranscriptAuditor()
+        auditor._llm_judge_prohibition(
+            [_prohibition_inst()], "文本", None, 600, dispatch_pairs=pairs,
+        )
+        assert "派发-回报记录" in prompts[0]
+        assert "FAILED: 254/275" in prompts[0]

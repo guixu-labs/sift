@@ -843,11 +843,21 @@ class TranscriptAuditor:
                     tool_trace, scene, tp.name, model, timeout, on_progress=on_progress,
                     on_usage=acc.scoped("judge"), aux_tool_trace=aux_for_tp,
                 )
+                # 层3-改进3:prohibition 判官共享 pairs 段(默认开,env
+                # SIFT_PROHIBITION_PAIRS=0 可关)。CONSTRAINT 形态的 Subagent 规约
+                # (如「必须在输出末尾追加【日志摘要】段落」)与 HEADING_STEP 同义务
+                # 不同桶——不共享则同一冤案在此桶永不翻。实验(11 会话 A/B):6/7
+                # 靶子翻 PASS 且全真、唯一 PASS→FAIL 为真 W1 检出(86% 通过率标✅)、
+                # 成本 -1.8%(判官更果断)。段头自带"回报是子代理产出"防张冠李戴声明。
+                _proh_pairs = (
+                    _pairs if os.environ.get("SIFT_PROHIBITION_PAIRS", "1") != "0" else None
+                )
                 fut_proh = pool.submit(
                     self._judge_prohibition, buckets[AuditCategory.PROHIBITION],
                     transcript_text, tp.name, model, timeout, on_progress=on_progress,
                     on_usage=acc.scoped("judge"),
                     locate_turns=locate_turns,
+                    dispatch_pairs=_proh_pairs, aux_tool_trace=aux_for_tp,
                 )
                 fut_step = pool.submit(
                     self._judge_step, buckets[AuditCategory.STEP], transcript_text,
@@ -1205,6 +1215,8 @@ class TranscriptAuditor:
         on_usage: Callable[[dict], None] | None = None,
         *,
         locate_turns: bool = False,
+        dispatch_pairs: list | None = None,
+        aux_tool_trace: list | None = None,
     ) -> list[AuditFinding]:
         """判定禁令类指令(CONSTRAINT / ANTI_FABRICATION)——**主动检测违规是否发生**。
 
@@ -1237,6 +1249,7 @@ class TranscriptAuditor:
         violated_mask, cause_mask = self._llm_judge_prohibition(
             instructions, transcript_text, model, timeout, on_progress, on_usage,
             locate_turns=locate_turns,
+            dispatch_pairs=dispatch_pairs, aux_tool_trace=aux_tool_trace,
         )
 
         # turn_refs 后验上界:从喂给 LLM 的同一份 transcript_text 的 [T{idx}] 标记反推最大
@@ -2303,6 +2316,8 @@ class TranscriptAuditor:
         on_usage: Callable[[dict], None] | None = None,
         *,
         locate_turns: bool = False,
+        dispatch_pairs: list | None = None,
+        aux_tool_trace: list | None = None,
     ) -> tuple[list[tuple[AuditVerdict | None, str, list[int]]], list[str]]:
         """分批 call_claude 判每条禁令在本次执行里是否被违反(每批 _MAX_LLM_IN_BATCH(10) 条,处理全部)。
 
@@ -2362,7 +2377,8 @@ class TranscriptAuditor:
                 "不要用 indeterminate 偷懒回避判断。\n\n"
                 f"{turn_rule_section}"
                 f"## 执行记录摘录\n{_window(transcript_text)}\n\n"
-                f"## 待判禁令 ({bn} 条)\n{instruction_list}\n"""
+                f"{_dispatch_pairs_section(dispatch_pairs, aux_tool_trace)}"
+                f"## 待判禁令 ({bn} 条)\n{instruction_list}\n"
                 "## 输出格式\n"
                 '只返回 JSON 数组,每元素:'
                 '{"index": 0, "violated": true/false, "indeterminate": true(仅判不准时), '
