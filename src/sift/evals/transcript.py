@@ -45,6 +45,25 @@ _BASH_WRITE_RE = re.compile(
     r"""(?:>>?\s*|tee\s+(?:-a\s+)?)['"]?([^\s'";|&]+)"""
 )
 
+# A3(dispatch prompt 截断):task/Agent 派发类 tool_call 的 input(prompt/要求清单)是
+# 编排会话里主 agent 行为的核心证据,统一 [:200] 会掐掉要求清单 → 判官"看不见"派发
+# 内容(缺席式误判,实测 fc73 #73:LOG.md 要求在 prompt 第 ~600 字符处)。
+# 默认 2000(A3 实验结论:覆盖 92% 派发内容,token 2.2-4.0x、墙钟不变;见
+# docs/a3-truncation-experiment.md)。env SIFT_TASK_SUMMARY_LIMIT 可覆盖(实验消
+# 融用,如 =200 回旧行为);其他工具保持 200。
+_DISPATCH_TOOL_NAMES = {"task", "agent"}
+_DISPATCH_SUMMARY_LIMIT = 2000
+
+
+def _summary_limit_for(tool_name: str) -> int:
+    if tool_name.strip().lower() not in _DISPATCH_TOOL_NAMES:
+        return 200
+    raw = os.environ.get("SIFT_TASK_SUMMARY_LIMIT", "")
+    try:
+        return max(200, int(raw)) if raw else _DISPATCH_SUMMARY_LIMIT
+    except ValueError:
+        return _DISPATCH_SUMMARY_LIMIT
+
 
 class FileContent(BaseModel):
     path: str
@@ -407,7 +426,10 @@ def _digest_from_records(
             try:
                 tool_trace.append(ToolCallRecord(
                     name=name,
-                    input_summary=json.dumps(b.get("input") or {}, ensure_ascii=False)[:200],
+                    # A3:dispatch 类(task/Agent)的 input_summary 上限放宽(默认 2000,
+                    # env SIFT_TASK_SUMMARY_LIMIT 可覆盖)——派发 prompt 是编排会话里
+                    # 主 agent 行为的核心证据,200 截断会掐掉要求清单(缺席式误判)。
+                    input_summary=json.dumps(b.get("input") or {}, ensure_ascii=False)[:_summary_limit_for(name)],
                     input=inp or None,  # 完整结构化参数(不截断),供参数级匹配/路径规范化;inp 见上(line 274)
                     turn=turn_idx if locate_turns else None,
                     tool_use_id=str(tid) if structured_v2 and tid else None,
