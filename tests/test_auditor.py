@@ -1466,9 +1466,49 @@ def test_audit_attaches_available_provenance_without_changing_findings(tmp_path,
     report = TranscriptAuditor().audit("skill", "", [transcript])
 
     assert calls == [digest]
-    assert report.provenance[transcript.name].available is True
+    assert list(report.provenance) == ["v2.jsonl"]
+    assert report.provenance["v2.jsonl"].available is True
     assert report.summary["total"] == 0
     assert report.findings == []
+
+
+@pytest.mark.parametrize("has_refs", [False, True])
+def test_audit_prechecks_provenance_without_losing_reference_only_evidence(tmp_path, monkeypatch, has_refs):
+    transcript = tmp_path / "session.jsonl"
+    digest = SessionDigest()
+    if has_refs:
+        from sift.models import FileEffectRecord
+        digest.evidence_refs = {"capture:test": FileEffectRecord(
+            path="a.py", evidence_ref="capture:test", quality="observed", capture_id="test",
+        )}
+    calls = []
+
+    def analyze(value):
+        calls.append(value)
+        return ProvenanceAuditResult(available=True)
+
+    monkeypatch.setattr("sift.audit.auditor.rebuild", lambda *args, **kwargs: ([], "", digest))
+    monkeypatch.setattr("sift.audit.auditor.analyze_provenance", analyze)
+    report = TranscriptAuditor().audit("skill", "", [transcript])
+    assert len(calls) == int(has_refs)
+    assert bool(report.provenance) == has_refs
+
+
+def test_failed_rebuild_skips_provenance(tmp_path, monkeypatch):
+    from sift.errors import SiftError
+
+    def rebuild(*args, **kwargs):
+        raise SiftError("invalid evidence")
+
+    def analyze(*args):
+        pytest.fail("failed rebuild must not reach analyzer")
+
+    monkeypatch.setattr("sift.audit.auditor.rebuild", rebuild)
+    monkeypatch.setattr("sift.audit.auditor.analyze_provenance", analyze)
+    report = TranscriptAuditor().audit("skill", "", [tmp_path / "bad.jsonl"])
+    assert report.provenance == {}
+    assert report.findings == []
+    assert any("invalid evidence" in warning for warning in report.warnings)
 
 
 class TestAuditNoiseWiring:

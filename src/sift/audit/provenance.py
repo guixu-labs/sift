@@ -264,13 +264,19 @@ def _build_timeline_summary(
     return dict(out)
 
 
+def has_provenance_evidence(digest: SessionDigest) -> bool:
+    """检查证据入口，兼容空 v2 证据包以及直接提供时间线或引用的调用者。"""
+    metadata = digest.evidence_metadata or {}
+    return metadata.get("version") == _PROVENANCE_SCHEMA_VERSION or bool(
+        digest.provenance_timeline or digest.evidence_refs
+    )
+
+
 def analyze_provenance(digest: SessionDigest) -> ProvenanceAuditResult:
     """在不调用 LLM 的前提下分析证据健康度和执行行为。"""
-    metadata = digest.evidence_metadata or {}
-    has_provenance_data = bool(digest.provenance_timeline or digest.evidence_refs)
-    available = metadata.get("version") == _PROVENANCE_SCHEMA_VERSION or has_provenance_data
-    if not available:
+    if not has_provenance_evidence(digest):
         return ProvenanceAuditResult(available=False)
+    metadata = digest.evidence_metadata or {}
 
     # 全部事件用于证据健康检查；只有带合法时间戳的事件参与状态推理。
     all_events = list(digest.provenance_timeline)

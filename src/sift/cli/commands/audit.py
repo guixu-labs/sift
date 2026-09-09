@@ -474,11 +474,11 @@ def audit(
     # provenance 证据时显示一行摘要，完整 findings/timeline 随 JSON 嵌入报告。
     if report.provenance:
         capture_count = sum(
-            int(result.statistics.get("capture_count", 0))
+            result.get_count("capture_count")
             for result in report.provenance.values()
         )
         effect_count = sum(
-            int(result.statistics.get("effect_count", 0))
+            result.get_count("effect_count")
             for result in report.provenance.values()
         )
         console.print(

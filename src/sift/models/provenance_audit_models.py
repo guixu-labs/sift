@@ -69,3 +69,8 @@ class ProvenanceAuditResult(BaseModel):
     findings: list[ProvenanceFinding] = Field(default_factory=list)
     file_timelines: dict[str, list[ProvenanceTimelineEntry]] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+
+    def get_count(self, name: str) -> int:
+        """读取摘要计数；缺失或非负整数以外的值按零展示，保留原始统计。"""
+        value = self.statistics.get(name)
+        return value if type(value) is int and value >= 0 else 0

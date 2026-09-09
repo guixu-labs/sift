@@ -86,7 +86,7 @@ from sift.concurrency import (
     configure_max_concurrent,
 )
 from sift.audit.noise import annotate_aggregate_noise, annotate_noise
-from sift.audit.provenance import analyze_provenance
+from sift.audit.provenance import analyze_provenance, has_provenance_evidence
 from sift.compliance.extractor import InstructionExtractor
 from sift.errors import SiftError
 from sift.evals.opencode import transcript_source
@@ -679,14 +679,16 @@ class TranscriptAuditor:
                 boundary_traces.append((tp.name, tool_trace))
             except SiftError as e:
                 # 坏/空 transcript:不崩,记 warning 跳过(其余 transcript 照常处理)。
+                # 未能重建有效 digest 时，声明对账与文件归因分析均跳过该记录。
                 warnings.append(f"{tp.name}: {e}")
                 continue
 
             # v2 证据自动进入独立 provenance 区块。Analyzer 是纯本地确定性逻辑，
             # 不改变既有 AuditFinding、coverage、PASS/FAIL 汇总或 exit code。
-            provenance_result = analyze_provenance(digest)
-            if provenance_result.available:
-                provenance_results[tp.name] = provenance_result
+            if has_provenance_evidence(digest):
+                provenance_result = analyze_provenance(digest)
+                if provenance_result.available:
+                    provenance_results[tp.name] = provenance_result
 
             derived = derive_declarations(digest, instructions)
             all_inst = instructions + derived
