@@ -59,8 +59,10 @@ def _fake_report() -> AuditReport:
 class _FakeAuditor:
     def __init__(self): self.calls: list[dict] = []
     def audit(self, skill_name, skill_body, transcripts, model=None, timeout=600,
-              on_progress=None, refine_instructions=False, generate_headline=False, locate_turns=False, declared_tools=None):
-        self.calls.append({"skill_name": skill_name, "transcripts": list(transcripts)})
+              on_progress=None, refine_instructions=False, generate_headline=False, locate_turns=False,
+              declared_tools=None, aux_tool_traces=None):
+        self.calls.append({"skill_name": skill_name, "transcripts": list(transcripts),
+                           "aux_tool_traces": aux_tool_traces})
         return _fake_report()
 
 
@@ -91,6 +93,11 @@ def test_kind_root_cc_slices_main_scope(monkeypatch, tmp_path):
     assert "MAIN_TXT" in content and "/tmp/app.log" in content
     assert "SUB_TXT" not in content                  # 子 agent 内部排除
 
+    # A1 旁路:被 root 切片排除的子代理痕迹作为 aux 传入(与 slices 同序;
+    # 本 fixture 的子 agent 段只有文本无 tool_use → aux 为空列表但非 None)
+    aux = fake.calls[0]["aux_tool_traces"]
+    assert aux is not None and len(aux) == 1
+
 
 def test_kind_root_opencode_uses_session_info_agent(monkeypatch, tmp_path):
     """opencode:--kind root 以 session.info.agent 为 target(复用 slice_opencode_by_agent)。"""
@@ -113,6 +120,10 @@ def test_kind_root_opencode_uses_session_info_agent(monkeypatch, tmp_path):
     for seg_path in slices:
         seg = json.loads(Path(seg_path).read_text(encoding="utf-8"))
         assert (seg.get("info") or {}).get("agent") == main_agent
+
+    # A1 旁路:opencode 形不适用 → 每段空列表(非 None,长度与 slices 对齐)
+    aux = fake.calls[0]["aux_tool_traces"]
+    assert aux is not None and len(aux) == len(slices) and all(a == [] for a in aux)
 
 
 def test_kind_root_structured_records_excludes_subagent(monkeypatch, tmp_path):
@@ -152,6 +163,12 @@ def test_kind_root_structured_records_excludes_subagent(monkeypatch, tmp_path):
     content = Path(slices[0]).read_text(encoding="utf-8")
     assert "MAIN_TXT" in content and "/tmp/main.md" in content
     assert "SUB_TXT" not in content                  # 子 agent 内部排除
+
+    # A1 旁路:被切片排除的子代理工具调用进 aux(角色名透传),供条件类第二遍匹配
+    aux = fake.calls[0]["aux_tool_traces"]
+    assert aux is not None and len(aux) == 1
+    assert len(aux[0]) == 1                          # 子 turn 的 1 个 read
+    assert aux[0][0].name == "Read" and aux[0][0].input == {"file_path": "/tmp/sub.md"}
 
 
 def test_kind_root_opencode_missing_info_agent_exits_2(monkeypatch, tmp_path):

@@ -93,7 +93,10 @@ def _command_word_re(tool_name: str):
 
 
 # input 里常见含路径的字段(Read/Write/Edit → file_path;Grep/Glob → path)
-_PATH_FIELDS = ("file_path", "path")
+# 路径字段:cc 原生 Read/Write 用 ``file_path``,opencode/insight structured records 用
+# camelCase ``filePath``(reader 不做字段名归一)——缺它则 insight 来源 transcript 的
+# REFERENCE_USAGE 存在性匹配系统性落空(全部漏到 LLM 兜底,缺席式误判的隐性来源)。
+_PATH_FIELDS = ("file_path", "path", "filePath")
 
 
 def _norm_path(p: str) -> str:
@@ -212,6 +215,81 @@ def count_tool_calls(tool_name: str, tool_trace, required_params=None) -> int:
     return n
 
 
+def find_execution_hit(tool_name: str, script_path: str, tool_trace, required_params=None):
+    """A1 旁路(aux 子代理痕迹)的**严格存在性**匹配:只认执行痕迹,不认文本提及。
+
+    与 ``find_tool_call``(root 主路径,"派发里有没有交代"的宽召回)语义不同:
+    旁路回答"子代理**做没做过**",文档内容里提及工具名(Write/Edit 的 content 写着
+    "已使用 X"、“调用 X”)不是执行。命中判据(任一):
+
+    1. ``tc.name`` 含 ``tool_name``(工具以该名义被调用,如 MCP 长名);
+    2. Skill 调用:``input.skill``/``input.name`` 含 ``tool_name``(skill 真被加载);
+    3. Bash:``tool_name`` 作为命令词出现在 ``input["command"]``(**词边界**,只搜
+       command 字段——不搜完整 input 的 content/prompt 等文本负载);
+    4. ``script_path`` 路径字段匹配(``_path_matches``,Read/Grep 的
+       file_path/filePath/path)。
+
+    ``required_params`` 只在 command 字段断言(同上,不搜文本负载)。
+    无命中 → None。空 tool_trace → None。
+    """
+    if not tool_trace:
+        return None
+    cmd_re = _command_word_re(tool_name)
+
+    def _get(tc, attr):
+        return getattr(tc, attr, None) if not isinstance(tc, dict) else tc.get(attr)
+
+    for tc in tool_trace:
+        tc_name = (_get(tc, "name") or "")
+        tc_input = _get(tc, "input")
+        tc_input = tc_input if isinstance(tc_input, dict) else {}
+        name_hit = bool(tool_name) and tool_name.lower() in tc_name.lower()
+        # Skill 加载:input.skill/input.name 是工具名本体(insight 路径 name → skill 已归一)
+        skill_hit = bool(tool_name) and tc_name.strip().lower() == "skill" and (
+            tool_name.lower() in str(tc_input.get("skill") or "").lower()
+            or tool_name.lower() in str(tc_input.get("name") or "").lower()
+        )
+        # Bash 命令词:只搜 command 字段(文档 content/prompt 文本提及不算执行)
+        cmd_field = str(tc_input.get("command") or "")
+        cmd_hit = bool(cmd_re) and bool(cmd_re.search(cmd_field))
+        if not (name_hit or skill_hit or cmd_hit):
+            if not (script_path and _path_matches(script_path, tc)):
+                continue
+        if required_params:
+            params = [p for p in required_params if p and "{" not in p and "}" not in p]
+            if params and not all(p.lower() in cmd_field.lower() for p in params):
+                continue
+        return tc
+    return None
+
+
+def find_tool_call(tool_name: str, script_path: str, tool_trace, required_params=None):
+    """返回 tool_trace 里**首条**命中判定的 tool call(与 ``match_tool_call`` 完全同判据);
+    无命中 → None。
+
+    消费方:A1 旁路匹配(auditor._judge_conditional 第二遍)需要命中的**那条记录**做
+    evidence 归属(子代理角色/turn),bool 不够用。判据细节见 ``match_tool_call``。
+    """
+    if not tool_trace:
+        return None
+    cmd_re = _command_word_re(tool_name)
+    for tc in tool_trace:
+        name_hit, cmd_hit = _tc_tool_hit(tc, tool_name, cmd_re, full_input_for_cmd=True)
+        if required_params:
+            # 有参数要求:命中工具(名/命令词)+ 所有参数满足才 True(存在性路径参数
+            # 也搜完整 input,同 _tc_tool_hit 的 full_input_for_cmd;频次路不搜)
+            if (name_hit or cmd_hit) and _params_satisfied(required_params, tc, full_input_for_cmd=True):
+                return tc
+            continue
+        if name_hit:
+            return tc
+        if script_path and _path_matches(script_path, tc):
+            return tc
+        if cmd_hit:
+            return tc
+    return None
+
+
 def match_tool_call(tool_name: str, script_path: str, tool_trace, required_params=None) -> bool:
     """tool_trace 里是否存在匹配的调用(大小写不敏感)。
 
@@ -236,21 +314,4 @@ def match_tool_call(tool_name: str, script_path: str, tool_trace, required_param
     tool_trace 元素支持 attr 风格(``tc.name``/``tc.input``/``tc.input_summary``,如
     ToolCallRecord)和 dict 风格(``tc.get(...)``)。遍历完无命中 → False;空/None tool_trace → False。
     """
-    if not tool_trace:
-        return False
-    cmd_re = _command_word_re(tool_name)
-    for tc in tool_trace:
-        name_hit, cmd_hit = _tc_tool_hit(tc, tool_name, cmd_re, full_input_for_cmd=True)
-        if required_params:
-            # 有参数要求:命中工具(名/命令词)+ 所有参数满足才 True(存在性路径参数
-            # 也搜完整 input,同 _tc_tool_hit 的 full_input_for_cmd;频次路不搜)
-            if (name_hit or cmd_hit) and _params_satisfied(required_params, tc, full_input_for_cmd=True):
-                return True
-            continue
-        if name_hit:
-            return True
-        if script_path and _path_matches(script_path, tc):
-            return True
-        if cmd_hit:
-            return True
-    return False
+    return find_tool_call(tool_name, script_path, tool_trace, required_params) is not None

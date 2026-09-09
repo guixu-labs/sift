@@ -2678,3 +2678,243 @@ class TestUnresolvedBreakdown:
     def test_empty_when_no_unresolved(self):
         from sift.audit.auditor import _unresolved_breakdown
         assert _unresolved_breakdown([]) == {}
+
+
+class TestAuxSubagentRescue:
+    """A1 旁路:条件类 root trace 未命中 → aux 子代理痕迹第二遍确定性匹配。
+
+    编排范式下执行类要求(跑命令/读文件)全部由子代理实际执行,主 scope 恒缺席;
+    aux 命中即"经派发执行"的事实 → PASS(确定性,不进 LLM),evidence 归属执行者。
+    """
+
+    def _aux_tc(self, name: str, inp: dict, agent: str = "verifier", turn: int = 42) -> ToolCallRecord:
+        return ToolCallRecord(
+            name=name, input_summary=json.dumps(inp, ensure_ascii=False)[:200],
+            input=inp, turn=turn, agent=agent,
+        )
+
+    def test_aux_hit_pass_no_llm(self, monkeypatch) -> None:
+        """root 未命中 + aux 命中 → PASS,method=PROGRAMMATIC,evidence 标注子代理
+        角色/turn/经派发执行,call_claude 未被调用。"""
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "sift.audit.auditor.call_claude", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "[]"
+        )
+        auditor = TranscriptAuditor()
+        root_trace = [_tc("Read", "读 STATE.md")]
+        aux = [self._aux_tc("Bash", {"command": "nm -D libcust_opapi.so"}, agent="kernel-verifier", turn=118)]
+
+        findings = auditor._judge_conditional(
+            [_tool_inst(text="使用 nm 检查符号", tool_name="nm")], root_trace, "场景", "t.jsonl",
+            aux_tool_trace=aux,
+        )
+        assert calls["n"] == 0  # 确定性命中,不调 LLM
+        f = findings[0]
+        assert f.verdict == AuditVerdict.PASS
+        assert f.method == AuditMethod.PROGRAMMATIC
+        assert "kernel-verifier" in f.evidence
+        assert "T118" in f.evidence
+        assert "经派发执行" in f.evidence
+        assert "主 trace 未命中" in f.evidence  # 与主路径 PASS 的 evidence 区分
+
+    def test_root_hit_takes_priority_over_aux(self, monkeypatch) -> None:
+        """root 命中优先:两条 trace 都有 → 走主路径 evidence("trace 中调用了"),
+        不提子代理(主 agent 亲自执行)。"""
+        monkeypatch.setattr("sift.audit.auditor.call_claude", lambda *a, **k: "[]")
+        auditor = TranscriptAuditor()
+        root_trace = [_tc("Bash", "nm -D x.so")]
+        aux = [self._aux_tc("Bash", {"command": "nm -D y.so"})]
+
+        findings = auditor._judge_conditional(
+            [_tool_inst(tool_name="nm")], root_trace, "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert findings[0].verdict == AuditVerdict.PASS
+        assert findings[0].evidence.startswith("trace 中调用了")
+
+    def test_aux_miss_falls_to_llm(self, monkeypatch) -> None:
+        """root + aux 都未命中 → 走 LLM 兜底(行为与旧版一致)。"""
+        def fake(prompt, *a, **k):
+            return json.dumps([{"index": 0, "applicable": True, "reason": "该做"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        findings = auditor._judge_conditional(
+            [_tool_inst(tool_name="curl")], [_tc("Bash", "ls")], "场景", "t.jsonl",
+            aux_tool_trace=[self._aux_tc("Read", {"filePath": "a.md"})],
+        )
+        assert findings[0].verdict == AuditVerdict.FAIL
+        assert findings[0].method == AuditMethod.LLM
+
+    def test_aux_none_and_empty_identical(self, monkeypatch) -> None:
+        """aux=None 与 aux=[]:均无旁路,未命中走 LLM(向后兼容)。"""
+        def fake(prompt, *a, **k):
+            return json.dumps([{"index": 0, "applicable": False, "reason": "不涉及"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        for aux in (None, []):
+            findings = auditor._judge_conditional(
+                [_tool_inst(tool_name="curl")], [_tc("Bash", "ls")], "场景", "t.jsonl",
+                aux_tool_trace=aux,
+            )
+            assert findings[0].verdict == AuditVerdict.NA
+
+    def test_aux_reference_usage_filepath(self, monkeypatch) -> None:
+        """REFERENCE_USAGE 的 aux 命中:子代理 Read 的 filePath(opencode camelCase)
+        匹配声明 script_path → PASS,evidence 标注"读取"。"""
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "sift.audit.auditor.call_claude", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "[]"
+        )
+        auditor = TranscriptAuditor()
+        aux = [self._aux_tc(
+            "Read",
+            {"filePath": "/data1/x/.opencode/skills/ops-ttk/references/ttk-gen-contract.md"},
+            agent="developer", turn=1531,
+        )]
+        findings = auditor._judge_conditional(
+            [_ref_inst(text="Use reference file: references/ttk-gen-contract.md",
+                       script_path="references/ttk-gen-contract.md")],
+            [], "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert calls["n"] == 0
+        f = findings[0]
+        assert f.verdict == AuditVerdict.PASS
+        assert "developer" in f.evidence and "读取" in f.evidence
+
+    def test_aux_required_params_still_enforced(self, monkeypatch) -> None:
+        """带 required_params 的条目:aux 命中工具但参数不满足 → 不算命中(走 LLM)。
+        参数级断言不因旁路放宽("工具名对、参数没照做"不放过)。"""
+        def fake(prompt, *a, **k):
+            return json.dumps([{"index": 0, "applicable": True, "reason": "该做"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        inst = _tool_inst(text="执行 pytest --tb=short", tool_name="pytest")
+        inst.params["required_params"] = ["--tb=short"]
+        aux = [self._aux_tc("Bash", {"command": "pytest"})]  # 无 --tb=short
+        findings = auditor._judge_conditional(
+            [inst], [], "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert findings[0].verdict == AuditVerdict.FAIL  # 参数不满足,旁路不洗
+
+    def test_aux_strict_no_text_mention_rescue(self, monkeypatch) -> None:
+        """严格匹配:Write/Edit 文档**内容**里提及工具名不算执行(假救援防护)。
+        fc73 实测:子代理 Write STATE.md 内容含"ascendc-docs-gen"字样,被宽匹配
+        误判"已调用"——该 skill 实际从未被加载(收尾任务未开始)。"""
+        def fake(prompt, *a, **k):
+            return json.dumps([{"index": 0, "applicable": True, "reason": "该做"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        aux = [self._aux_tc(
+            "Write", {"content": "# 工作流\n- [ ] 40. 调用 ascendc-docs-gen 生成文档"},
+            agent="state-generator",
+        )]
+        findings = auditor._judge_conditional(
+            [_tool_inst(text="调用 `ascendc-docs-gen", tool_name="ascendc-docs-gen")],
+            [], "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert findings[0].verdict == AuditVerdict.FAIL  # 文本提及不洗
+
+    def test_aux_strict_skill_invoke_rescues(self, monkeypatch) -> None:
+        """严格匹配:Skill tool_use 且 input.skill 含工具名 = 真加载 → PASS。"""
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "sift.audit.auditor.call_claude", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "[]"
+        )
+        auditor = TranscriptAuditor()
+        aux = [self._aux_tc("Skill", {"skill": "ascendc-env-check"}, agent="developer", turn=7)]
+        findings = auditor._judge_conditional(
+            [_tool_inst(text="使用 ascendc-env-check skill", tool_name="ascendc-env-check")],
+            [], "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert calls["n"] == 0
+        assert findings[0].verdict == AuditVerdict.PASS
+        assert "developer" in findings[0].evidence
+
+    def test_aux_strict_command_field_only_for_bash(self, monkeypatch) -> None:
+        """严格匹配:Bash 命令词只搜 command 字段;input 其他文本负载(如 description)
+        提及不算。"""
+        def fake(prompt, *a, **k):
+            return json.dumps([{"index": 0, "applicable": True, "reason": "该做"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        aux = [self._aux_tc("Bash", {"command": "ls -la", "description": "运行 nm 检查前先看目录"})]
+        findings = auditor._judge_conditional(
+            [_tool_inst(text="使用 nm", tool_name="nm")], [], "场景", "t.jsonl", aux_tool_trace=aux,
+        )
+        assert findings[0].verdict == AuditVerdict.FAIL  # description 提及不洗
+
+
+class TestStepDispatchPairs:
+    """层3:派发-回报对喂 step 判官——prompt 含"派发-回报记录"段与"传递≠达成"规则;
+    SIFT_DISPATCH_PAIRS=0 或 pairs=None 时行为与旧版一致。全程 mock call_claude。"""
+
+    def _pair(self, role="verifier", result="FAILED: 254/275"):
+        from sift.evals.transcript import DispatchReturn
+        return DispatchReturn(dispatch_turn=9, result_turn=10, role=role,
+                              prompt_head="验收 Task 47:黑盒全量", result_head=result,
+                              result_len=len(result))
+
+    def _step_inst(self):
+        return InstructionCheck(
+            source=InstructionSource.HEADING_STEP,
+            instruction_text="验收标准:黑盒全部用例全量执行且全部通过",
+            section="Tasks", priority=InstructionPriority.REQUIRED,
+            check_method=CheckMethod.LLM_JUDGE, params={},
+        )
+
+    def test_pairs_section_in_step_judge_prompt(self, monkeypatch) -> None:
+        """_llm_judge_step 的 prompt 含 pairs 段 + 规则行(传递≠达成)。"""
+        prompts = []
+
+        def fake(prompt, *a, **k):
+            prompts.append(prompt)
+            return json.dumps([{"index": 0, "verdict": "pass", "evidence": "走过"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        auditor._llm_judge_step(
+            [self._step_inst()], "执行记录文本", None, 600,
+            dispatch_pairs=[self._pair()], aux_tool_trace=None,
+        )
+        assert len(prompts) == 1
+        assert "派发-回报记录" in prompts[0]
+        assert "回报(子代理产出)" in prompts[0]
+        assert "FAILED: 254/275" in prompts[0]
+        assert "传递了要求 ≠ 达成了结果" in prompts[0]  # 规则行进 prompt
+
+    def test_pairs_none_keeps_old_prompt(self, monkeypatch) -> None:
+        """pairs=None → 段/规则都不进(prompt 与旧版同构)。"""
+        prompts = []
+
+        def fake(prompt, *a, **k):
+            prompts.append(prompt)
+            return json.dumps([{"index": 0, "verdict": "na", "evidence": "不涉及"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        auditor._llm_judge_step(
+            [self._step_inst()], "执行记录文本", None, 600, dispatch_pairs=None,
+        )
+        assert "派发-回报记录" not in prompts[0]
+        assert "传递了要求 ≠ 达成了结果" not in prompts[0]
+
+    def test_judge_step_passes_pairs_through(self, monkeypatch) -> None:
+        """_judge_step → _llm_judge_step 穿线:pairs 到达 prompt。"""
+        prompts = []
+
+        def fake(prompt, *a, **k):
+            prompts.append(prompt)
+            return json.dumps([{"index": 0, "verdict": "pass", "evidence": "ok"}])
+
+        monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
+        auditor = TranscriptAuditor()
+        findings = auditor._judge_step(
+            [self._step_inst()], "文本", "t.jsonl",
+            dispatch_pairs=[self._pair()],
+        )
+        assert findings[0].verdict == AuditVerdict.PASS
+        assert "派发-回报记录" in prompts[0]

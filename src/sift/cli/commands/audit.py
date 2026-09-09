@@ -302,8 +302,9 @@ def audit(
         # → slice_opencode_by_agent(kind=skill/agent 按声明名切;kind=root 取 session.info.agent);
         #   cc/structured(三锚点)→ slice_transcript(kind 选 root/skill/agent 锚点,不并集)。
         # 文件名带 transcript 级序号 ti:多个 --transcript 可能同名 stem,仅靠内层 i 会碰撞 → 后者覆盖前者。
+        aux_tool_traces: list[list] | None = None  # A1 旁路(kind=root 才填充,见下)
         if kind:
-            from sift.audit.slice import slice_transcript
+            from sift.audit.slice import build_subagent_tool_trace, slice_transcript
             from sift.evals.opencode import (
                 is_opencode_session,
                 load_opencode_session,
@@ -348,7 +349,19 @@ def audit(
             slice_dir = out / "slices"
             slice_dir.mkdir(parents=True, exist_ok=True)
             sliced: list[Path] = []
+            # A1 旁路(kind=root 专属):被 root 切片排除的子代理全量工具痕迹,
+            # 与 sliced 同序(每个 seg 一份;opencode 形不适用 → 空)。条件类条目
+            # root trace 未命中时在子代理痕迹里做第二遍确定性匹配(auditor),
+            # 洗"执行类动作全在子代理、主 scope 恒缺席"的缺席式误判。
+            # env SIFT_AUX_TRACE=0 显式关闭(A/B 实验与副作用逃生口;默认开)。
+            import os as _os
+            if kind == "root" and _os.environ.get("SIFT_AUX_TRACE", "1") != "0":
+                aux_tool_traces = []
             for tp, ti, i, seg, is_oc in segs:
+                if aux_tool_traces is not None:
+                    aux_tool_traces.append(
+                        [] if is_oc else build_subagent_tool_trace(tp)
+                    )
                 ext = ".json" if is_oc else ".jsonl"
                 sp = slice_dir / f"{tp.stem}-{name}-{ti}-{i}{ext}"
                 if is_oc:
@@ -366,6 +379,9 @@ def audit(
 
         # on_progress:audit 每批 LLM 判定 40-257s,边跑边报进度(transcript 头 + 每批 [k/总] + 耗时),
         # 否则全程静默、用户不知是否在跑。console.print 即时 flush,长跑也实时可见。
+        # aux_tool_traces 只在 kind=root 切片路径填充;None 时不传 kwarg——对
+        # TranscriptAuditor 的调用形态与旧版完全一致(测试 fake / 外部调用方零感知)。
+        _aux_kw = {"aux_tool_traces": aux_tool_traces} if aux_tool_traces is not None else {}
         report = TranscriptAuditor().audit(
             name, body, transcript, model=model,
             refine_instructions=refine_instructions,
@@ -373,6 +389,7 @@ def audit(
             locate_turns=locate_turns,
             declared_tools=fm_tools,
             on_progress=lambda msg: console.print(msg),
+            **_aux_kw,
         )
     except SiftError as exc:
         console.print(f"[red]Error:[/red] {exc}")

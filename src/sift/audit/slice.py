@@ -23,7 +23,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sift.evals.transcript import stamp_turn_indices
+from sift.evals.transcript import _summary_limit_for, stamp_turn_indices
+from sift.models import ToolCallRecord
 
 
 def _records(path: Path) -> list[dict]:
@@ -249,6 +250,75 @@ def _slice_root(records: list[dict]) -> list[list[dict]]:
     """
     root_recs = [r for r in records if _scope_of(r) is None]
     return [root_recs] if root_recs else []
+
+
+def slice_subagents(transcript_path: Path) -> list[list[dict]]:
+    """kind=root 的镜像切法:子代理作用域全部 record(parent_tool_use_id 非空)。
+
+    root 切片按设计排除子代理(审主 agent 编排纪律),但 STATE.md 的执行类步骤(跑命令/
+    写文件/加载 skill)在编排范式下**全部由子代理执行**,主 scope 工具痕迹恒为 0 →
+    条件类存在性判定(TOOL_REQUIREMENT/REFERENCE_USAGE)"缺席式"误判(A1)。
+    本函数返回被 root 切片排除的那半边,供 ``build_subagent_tool_trace`` 构建 aux 痕迹。
+    """
+    records = _records(transcript_path)
+    sub_recs = [r for r in records if _scope_of(r) is not None]
+    return [sub_recs] if sub_recs else []
+
+
+def build_subagent_tool_trace(transcript_path: Path, *, locate_turns: bool = True) -> list[ToolCallRecord]:
+    """A1 旁路证据源:子代理作用域全部工具调用(root 判定的"缺席≠未发生"洗冤通道)。
+
+    只收集**子代理作用域**的 tool_use(parent_tool_use_id 非空),root 作用域已在
+    判定主路径(rebuild 的 root trace)里,不重复。消费方:auditor._judge_conditional
+    的第二遍确定性匹配——条件类条目 root trace 未命中时在这里再找一遍,命中 →
+    PASS(evidence 标注"子代理 <role> 经派发执行")。**只做洗清嫌疑的确定性核对**:
+    不进 LLM prompt、不改 root 切片语义、不喂步骤/禁令判官(那些仍只看 root 视角)。
+
+    执行者角色名(agent 字段)归属优先级:
+    1. ``rec.agent``——insight structured 路径按 turn 吐的角色名(verifier/developer…);
+    2. 派发映射——cc 原生路径,主作用域 Agent/Task tool_use 的 ``id → subagent_type``
+       (子代理 record 的 parent_tool_use_id 指向该 tool_use);
+    3. 都无 → 空串(evidence 显示"子代理"不带角色)。
+
+    ``turn`` 为全量 stamp 的全局 turnIndex(与 root 切片同一体系,aux 命中证据可
+    用 [T{idx}] 对回 insight turnIndex)。
+    """
+    records = _records(transcript_path)
+    # cc 原生路径的派发映射:主作用域 Agent/Task tool_use 的 id → 角色(subagent_type)。
+    # insight structured 路径的 parent_tool_use_id 是 subagentSessionId(非 tool_use id),
+    # 映射查不到——但该路径 rec.agent 已带角色名,走优先级 1。
+    role_by_id: dict[str, str] = {}
+    for rec in records:
+        if _scope_of(rec) is not None:
+            continue
+        for b in _content_blocks(rec):
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and str(b.get("name") or "").lower() in ("agent", "task")):
+                tid = b.get("id", "")
+                role = ((b.get("input") or {}).get("subagent_type")
+                        or (b.get("input") or {}).get("agent") or "")
+                if tid and role:
+                    role_by_id[tid] = str(role)
+    trace: list[ToolCallRecord] = []
+    for rec in records:
+        ptid = _scope_of(rec)
+        if ptid is None:
+            continue
+        agent = rec.get("agent") or role_by_id.get(ptid, "")
+        turn_idx = rec.get("_turn_index")
+        for b in _content_blocks(rec):
+            if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                continue
+            name = b.get("name", "")
+            inp = b.get("input") or {}
+            trace.append(ToolCallRecord(
+                name=name,
+                input_summary=json.dumps(inp, ensure_ascii=False)[:_summary_limit_for(name)],
+                input=inp or None,
+                turn=turn_idx if locate_turns else None,
+                agent=str(agent or ""),
+            ))
+    return trace
 
 
 def slice_transcript(transcript_path: Path, target: str, kind: str) -> list[list[dict]]:

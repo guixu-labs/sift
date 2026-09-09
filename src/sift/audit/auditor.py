@@ -47,6 +47,7 @@
 """
 from __future__ import annotations
 
+import os
 import random
 import re
 import threading
@@ -69,6 +70,8 @@ from sift.audit.control_flow import (
 from sift.audit.tool_match import (
     count_tool_calls,
     extract_first_balanced,
+    find_execution_hit,
+    find_tool_call,
     load_json_lenient,
     match_tool_call,
 )
@@ -90,7 +93,7 @@ from sift.compliance.extractor import InstructionExtractor
 from sift.errors import SiftError
 from sift.evals.opencode import transcript_source
 from sift.execution.error_triage import classify_error
-from sift.models import InstructionCheck, InstructionSource
+from sift.models import InstructionCheck, InstructionSource, ToolCallRecord
 from sift.models.audit_models import (
     AuditCategory,
     AuditFinding,
@@ -163,6 +166,104 @@ def _tool_trace_section(tool_trace, locate_turns: bool) -> str:
     return (
         "## 实际工具调用记录(判涉及工具的步骤时以此为准,勿只凭文字声称)\n"
         f"{tool_lines}\n\n"
+    )
+
+
+_DISPATCH_PAIRS_LIMIT = 8000
+
+
+def _dispatch_pairs_section(pairs, aux_tool_trace=None) -> str:
+    """层3:派发-回报对 prompt 段(主 agent 视野内的委派证据,只喂 step 判官)。
+
+    - 统计行:派发次数/角色分布(来自 pairs)+ 子代理实际执行计数(来自 aux trace,
+      层1 已构建;无 aux 时缺省执行计数)——直接杀"全程没有任何实际运行测试"式断言。
+    - 每对一行:``[T派发→T回报] 角色「prompt 头」 → 回报: 回报头``。回报头显式标注
+      **子代理产出**——回报是子代理的报告,不是主 agent 的行为(防判官张冠李戴)。
+    - 裁剪(超 _DISPATCH_PAIRS_LIMIT):先压 trivial 回报(<20 字,如 DONE/空)成计数行;
+      仍超 → 保留含失败字样的行 + 首尾若干,中段标省略数。空 pairs → ""(段整体不进)。
+    """
+    if not pairs:
+        return ""
+
+    def _f(p, attr):
+        return getattr(p, attr) if hasattr(p, attr) else p.get(attr, "")
+
+    roles: dict[str, int] = {}
+    for p in pairs:
+        r = _f(p, "role") or "(未标注)"
+        roles[r] = roles.get(r, 0) + 1
+    role_str = " / ".join(f"{r} {n}" for r, n in sorted(roles.items(), key=lambda x: -x[1]))
+
+    exec_str = ""
+    if aux_tool_trace:
+        counts: dict[str, int] = {}
+        for t in aux_tool_trace:
+            n = (_f(t, "name") or "").strip().lower() or "(未知)"
+            counts[n] = counts.get(n, 0) + 1
+        top = "、".join(f"{n} {c} 次" for n, c in sorted(counts.items(), key=lambda x: -x[1])[:6])
+        exec_str = f";子代理实际执行 {top}"
+
+    def _fmt(p):
+        d, r = _f(p, "dispatch_turn"), _f(p, "result_turn")
+        rng = f"[T{d}→T{r}]" if (d is not None and r is not None) else (
+            f"[T{d}→?]" if d is not None else "")
+        rh = " ".join(str(_f(p, "result_head") or "(无回报)").split())
+        rt = " ".join(str(_f(p, "result_tail") or "").split())
+        # 头+尾窗口(改进2):结论惯例在回报尾部("状态:✅通过"/"FAILED X/Y"收尾),
+        # 尾窗非空且不与头部重叠时以「…尾」衔接,保证验收结论必然可见。
+        shown = rh[:120]
+        if rt and rt not in shown:
+            shown = f"{shown} …尾: {rt[:60]}"
+        ph = " ".join(str(_f(p, "prompt_head") or "").split())
+        role = _f(p, "role") or "子代理"
+        return f"- {rng} {role}「{ph[:80]}」 → 回报(子代理产出): {shown}"
+
+    def _is_failed(l):
+        return any(m in l for m in ("FAILED", "失败", "❌"))
+
+    lines = [_fmt(p) for p in pairs]
+    n_failed = sum(1 for l in lines if _is_failed(l))
+    stats = (f"统计:派发 {len(pairs)} 次({role_str}){exec_str};"
+             f"回报含失败字样 {n_failed} 份")
+
+    body = "\n".join(lines)
+    if len(body) + len(stats) > _DISPATCH_PAIRS_LIMIT:
+        # 保序单遍:失败行全留(先占预算);trivial(回报<20字)压计数;其余按余量收
+        budget = _DISPATCH_PAIRS_LIMIT - len(stats) - 300  # 300 = 段头+压缩标记余量
+        kept: list[str] = []
+        n_trivial = 0
+        for p, l in zip(pairs, lines):
+            if _is_failed(l):
+                kept.append(l)
+                budget -= len(l) + 1
+            elif len(str(_f(p, "result_head"))) < 20:
+                n_trivial += 1
+            elif budget > 0:
+                kept.append(l)
+                budget -= len(l) + 1
+        dropped = len(lines) - len(kept) - n_trivial
+        parts = kept
+        if dropped > 0:
+            parts.append(f"…(中段省略 {dropped} 条派发)")
+        if n_trivial > 0:
+            parts.append(f"(另有 {n_trivial} 次派发回报为 DONE/空等短文本)")
+        body = "\n".join(parts)
+
+    return (
+        "## 子代理派发-回报记录(主 agent 视野内的委派证据;回报是**子代理产出**,"
+        "判执行/验收/义务类步骤时参考;勿把回报内容当主 agent 亲自执行)\n"
+        f"{stats}\n{body}\n\n"
+    )
+
+
+def _dispatch_pairs_rule_section() -> str:
+    """层3 判定规则行:验收/结果类步骤以"回报结论 + 处置"为准(治 A3 结果类假 PASS)。"""
+    return (
+        "- 验收/结果类步骤(验收标准、全量执行、达标类):**派发 prompt 传递了要求 ≠ "
+        "达成了结果**。以派发**回报**的结论为准:回报 FAILED/未达标而主 agent 仍派发"
+        "后续任务 → fail(门禁失守);回报明确通过且推进合规 → pass;声明要求验收但"
+        "找不到对应验收派发 → fail(免验);回报缺失时按窗口规则判,不得仅凭 prompt "
+        "传递了要求就 pass。\n"
     )
 
 
@@ -536,6 +637,7 @@ class TranscriptAuditor:
         *,
         locate_turns: bool = False,
         declared_tools: dict[str, str] | None = None,
+        aux_tool_traces: list[list[ToolCallRecord]] | None = None,
     ) -> AuditReport:
         """聚合主入口:把 skill 声明的指令 + transcript 反推声明逐条对账若干 transcript。
 
@@ -567,6 +669,11 @@ class TranscriptAuditor:
             declared_tools: 声明 frontmatter 的工具白名单(``boundary.frontmatter_tool_names``
                 产,``{lower 名: 显示文本}``),只喂越界视图对账;None = 无 frontmatter
                 声明(引擎层不读文件,由 CLI/runner 传入)。
+            aux_tool_traces: A1 旁路证据源,与 ``transcripts`` **同序**的子代理全量
+                工具痕迹列表(元素可为空列表 = 该 transcript 无旁路;None = 全部无旁路,
+                行为与旧版完全一致)。仅 ``--kind root`` 时 CLI 传入:条件类
+                (TOOL_REQUIREMENT/REFERENCE_USAGE)root trace 未命中时在对应子代理
+                痕迹里做第二遍确定性匹配,命中 → PASS(evidence 标注执行者)。
 
         Returns:
 
@@ -670,6 +777,10 @@ class TranscriptAuditor:
 
         for ti, tp in enumerate(transcripts, 1):
             _emit(on_progress, f"对账 transcript {ti}/{len(transcripts)}: {tp.name}")
+            # A1 旁路:与 transcripts 同序的 aux(0-based 索引);None/越界/空 → 无旁路。
+            aux_for_tp: list[ToolCallRecord] | None = None
+            if aux_tool_traces is not None and ti - 1 < len(aux_tool_traces):
+                aux_for_tp = aux_tool_traces[ti - 1] or None
             try:
                 _t = time.perf_counter()
                 tool_trace, transcript_text, digest = rebuild(tp, locate_turns=locate_turns)
@@ -715,10 +826,22 @@ class TranscriptAuditor:
             # 线程安全,三类 [k/总] 交错可读。
             _t = time.perf_counter()
             with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT) as pool:
+                # 层3:派发-回报对(env SIFT_DISPATCH_PAIRS=0 可关——A/B 实验与逃生口;
+                # 默认开)。digest.dispatch_returns 由 rebuild 从切片里的 task/Agent
+                # tool_use + tool_result 配对收集(insight 侧已透传 dispatch result;
+                # cc 原生 jsonl 天生就有)。step 判官默认喂;prohibition 判官经
+                # SIFT_PROHIBITION_PAIRS=1 共享(层3-改进3,默认关)。aux 复用层1 的
+                # 子代理痕迹做执行统计行。
+                _pairs = (
+                    digest.dispatch_returns
+                    if (digest.dispatch_returns
+                        and os.environ.get("SIFT_DISPATCH_PAIRS", "1") != "0")
+                    else None
+                )
                 fut_cond = pool.submit(
                     self._judge_conditional, buckets[AuditCategory.CONDITIONAL],
                     tool_trace, scene, tp.name, model, timeout, on_progress=on_progress,
-                    on_usage=acc.scoped("judge"),
+                    on_usage=acc.scoped("judge"), aux_tool_trace=aux_for_tp,
                 )
                 fut_proh = pool.submit(
                     self._judge_prohibition, buckets[AuditCategory.PROHIBITION],
@@ -731,6 +854,7 @@ class TranscriptAuditor:
                     tp.name, model, timeout, tool_trace=tool_trace, on_progress=on_progress,
                     on_usage=acc.scoped("judge"),
                     locate_turns=locate_turns,
+                    dispatch_pairs=_pairs, aux_tool_trace=aux_for_tp,
                 )
                 # 控制流判官作第 4 个 submit:排队等空位、可搭三类判官拖尾,落在
                 # 本 judge 计时段内;内部多批由 _run_batches_concurrent 自带池并发,全局在飞
@@ -943,12 +1067,16 @@ class TranscriptAuditor:
         timeout: int = 600,
         on_progress: ProgressFn | None = None,
         on_usage: Callable[[dict], None] | None = None,
+        aux_tool_trace: list | None = None,
     ) -> list[AuditFinding]:
         """判定条件性指令(TOOL_REQUIREMENT / REFERENCE_USAGE)的三态结论。
 
         每条指令先走确定性 ``match_tool_call``(命中 tool_trace → PASS,不调 LLM);
-        未命中的批量交 LLM 判"场景是否该触发该指令",据此分 FAIL(该做没做) /
-        N/A(场景不涉及);LLM 失败/异常/解析失败 → 标 N/A(宁少报不乱报)。未命中全量交 LLM,
+        root 未命中且有 ``aux_tool_trace`` 时再走第二遍确定性匹配(命中 → PASS,
+        evidence 标注"子代理 <role> 经派发执行"——A1 缺席式误判的洗冤通道,
+        命中即事实、不进 LLM);两遍都未命中的批量交 LLM 判"场景是否该触发该
+        指令",据此分 FAIL(该做没做) / N/A(场景不涉及);LLM 失败/异常/解析失败
+        → 标 N/A(宁少报不乱报)。未命中全量交 LLM,
         >_MAX_LLM_IN_BATCH 由 ``_llm_judge_applicable`` 内部分批循环(无超限兜底 N/A)。
 
         Args:
@@ -958,6 +1086,8 @@ class TranscriptAuditor:
             transcript_name: 该 transcript 的文件名,填进 finding.transcript。
             model: LLM 模型名(None 走 call_claude 默认)。
             timeout: LLM 调用超时秒数。
+            aux_tool_trace: 子代理作用域全量工具痕迹(slice.build_subagent_tool_trace,
+                仅 kind=root 时 CLI 传入;None/空 = 无旁路,行为与旧版完全一致)。
 
         Returns:
             每条指令一个 AuditFinding,顺序与输入一致;category 全 CONDITIONAL;
@@ -976,6 +1106,20 @@ class TranscriptAuditor:
             if match_tool_call(tool_name, script_path, tool_trace, required_params=required_params):
                 findings[i] = self._make_match_pass_finding(
                     inst, tool_name, script_path, transcript_name, required_params
+                )
+                continue
+            # A1 旁路(第二遍确定性匹配,只在 root 模式 CLI 传入 aux 时激活):
+            # 主 scope 未命中 ≠ 未发生——编排范式下执行类动作全部在子代理,
+            # 子代理痕迹命中即"经派发执行"的事实,直接 PASS(不进 LLM)。
+            # 用 find_execution_hit(严格匹配:只认执行痕迹,不认文档内容提及)——
+            # "写过'已使用 X'"不是"执行了 X"。
+            aux_hit = (
+                find_execution_hit(tool_name, script_path, aux_tool_trace, required_params=required_params)
+                if aux_tool_trace else None
+            )
+            if aux_hit is not None:
+                findings[i] = self._make_aux_pass_finding(
+                    inst, tool_name, script_path, transcript_name, aux_hit, required_params
                 )
             else:
                 unmatched.append((i, inst))
@@ -1173,6 +1317,8 @@ class TranscriptAuditor:
         on_usage: Callable[[dict], None] | None = None,
         *,
         locate_turns: bool = False,
+        dispatch_pairs: list | None = None,
+        aux_tool_trace: list | None = None,
     ) -> list[AuditFinding]:
         """判定步骤类指令(HEADING_STEP)的三态结论。
 
@@ -1204,9 +1350,12 @@ class TranscriptAuditor:
 
         # 全量交 LLM 判(>_MAX_LLM_IN_BATCH 由 _llm_judge_step 内部分批循环)。
         # locate_turns 透传:False 时 prompt 不含 turn 引用规则、tool_section 无 [T{idx}]。
+        # 层3:dispatch_pairs(派发-回报对)+ aux(子代理执行统计)喂 step 判官——
+        # 缺席式误判("全程没跑测试"/义务链/交付物缺失)的洗冤证据 + 验收结论依据。
         verdict_mask, cause_mask = self._llm_judge_step(
             instructions, transcript_text, model, timeout, tool_trace, on_progress, on_usage,
             locate_turns=locate_turns,
+            dispatch_pairs=dispatch_pairs, aux_tool_trace=aux_tool_trace,
         )
 
         # turn_refs 后验上界:从喂给 LLM 的同一份 transcript_text 的 [T{idx}] 标记反推最大
@@ -1413,6 +1562,48 @@ class TranscriptAuditor:
             evidence = f"trace 中调用了 {tool_name}"
         else:
             evidence = f"trace 中读取了 {script_path}"
+        params = [p for p in (required_params or []) if p]
+        if params and tool_name:
+            evidence += f"(含 {' '.join(params)})"
+        return AuditFinding(
+            instruction_text=inst.instruction_text,
+            source_excerpt=inst.source_excerpt,
+            headline=inst.headline,
+            section=inst.source_section or inst.section,
+            source=inst.source.value,
+            verdict=AuditVerdict.PASS,
+            method=AuditMethod.PROGRAMMATIC,
+            category=AuditCategory.CONDITIONAL,
+            evidence=evidence,
+            transcript=transcript_name,
+        )
+
+    @staticmethod
+    def _make_aux_pass_finding(
+        inst: InstructionCheck,
+        tool_name: str,
+        script_path: str,
+        transcript_name: str,
+        tc,
+        required_params=None,
+    ) -> AuditFinding:
+        """root trace 未命中、**子代理**痕迹命中(aux 旁路)的 PASS finding。
+
+        A1:root 切片按设计排除子代理,编排范式下执行类要求(跑命令/读文件/加载 skill)
+        全部由子代理实际执行 → 主 scope 恒缺席、LLM 兜底判"该做没做"=缺席式误判。
+        子代理痕迹命中是确定性事实 → PASS;evidence 归属到执行者(子代理角色 + turn),
+        与"主 agent 亲自执行"的 PASS(_make_match_pass_finding)在证据上区分开——
+        保持诚实:W5 语义("该亲自做的没亲自做")由 prohibition/step 判官把守,不经此路。
+        ``tc`` 支持 attr / dict 风格(同 match_tool_call 惯例)。
+        """
+        def _f(attr: str):
+            return getattr(tc, attr, None) if not isinstance(tc, dict) else tc.get(attr)
+
+        agent = (_f("agent") or "").strip() or "子代理"
+        turn = _f("turn")
+        what = f"调用了 {tool_name}" if tool_name else f"读取了 {script_path}"
+        where = f"(T{turn})" if turn is not None else ""
+        evidence = f"主 trace 未命中;子代理 {agent}{where} 实际{what}(经派发执行)"
         params = [p for p in (required_params or []) if p]
         if params and tool_name:
             evidence += f"(含 {' '.join(params)})"
@@ -2171,7 +2362,7 @@ class TranscriptAuditor:
                 "不要用 indeterminate 偷懒回避判断。\n\n"
                 f"{turn_rule_section}"
                 f"## 执行记录摘录\n{_window(transcript_text)}\n\n"
-                f"## 待判禁令 ({bn} 条)\n{instruction_list}\n"
+                f"## 待判禁令 ({bn} 条)\n{instruction_list}\n"""
                 "## 输出格式\n"
                 '只返回 JSON 数组,每元素:'
                 '{"index": 0, "violated": true/false, "indeterminate": true(仅判不准时), '
@@ -2260,6 +2451,8 @@ class TranscriptAuditor:
         on_usage: Callable[[dict], None] | None = None,
         *,
         locate_turns: bool = False,
+        dispatch_pairs: list | None = None,
+        aux_tool_trace: list | None = None,
     ) -> tuple[list[tuple[AuditVerdict | None, str, list[int]]], list[str]]:
         """分批 call_claude 判每个步骤在本次执行里是否被走过(每批 _MAX_LLM_IN_BATCH(10) 条,处理全部)。
 
@@ -2303,6 +2496,11 @@ class TranscriptAuditor:
             # 让 LLM 能把工具调用对到具体 turn → step 的 turn_refs 引用更准(turn 粒度定位);
             # locate_turns=False 时不带前缀、段标题也不提示 [T{idx}](整链关 turn 定位)。
             tool_section = _tool_trace_section(tool_trace, locate_turns)
+            # 层3:派发-回报对段(每批同段——证据是 transcript 级的,非批级;8KB 封顶)
+            # + 验收类判定规则行(传递≠达成)。段/规则只在有 pairs 时进(无派发的
+            # 单 agent transcript 行为与旧版完全一致)。
+            pairs_section = _dispatch_pairs_section(dispatch_pairs, aux_tool_trace)
+            pairs_rule = _dispatch_pairs_rule_section() if pairs_section else ""
             # locate_turns=False 时整段 turn 引用规则不进 prompt,输出格式也不要求 turn_refs
             # (与 _llm_judge_prohibition 同款;judge 层 locate_turns=False 时返回的 turn_refs 丢弃)。
             turn_rule_section = _turn_rule_section(locate_turns)
@@ -2319,12 +2517,14 @@ class TranscriptAuditor:
                 "不得借此洗成 na;**证据中段的空洞**(如工具记录从 Tn 直接跳到 Tm、"
                 "其间无该步骤任何痕迹)就是没走,判 fail——不得脑补「中间的调用未"
                 "收录但已执行」,窗口判 na 只适用于记录末尾之后的计划步骤。\n"
+                f"{pairs_rule}"
                 "- indeterminate:你看了执行记录,但证据真的相互矛盾或关键信息缺失,"
                 "判断不了走没走。**必须**在 evidence 写明具体矛盾 / 缺失的证据;"
                 "不要用 indeterminate 偷懒回避判断。\n\n"
                 f"{turn_rule_section}"
                 f"## 执行记录摘录\n{_window(transcript_text)}\n\n"
                 f"{tool_section}"
+                f"{pairs_section}"
                 f"## 待判步骤 ({bn} 条)\n{instruction_list}\n"
                 "## 输出格式\n"
                 '只返回 JSON 数组,每元素:'
