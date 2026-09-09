@@ -408,7 +408,7 @@ def test_build_subagent_tool_trace_agent_attribution_via_dispatch(tmp_path):
     a_id = "agent-1"
     recs = [
         _agent(a_id),  # input.subagent_type = "general-purpose"(默认 helper)
-        _in_sub(a_id, _tool_use("tu1", "Bash", {"command": "nm -D libcust_opapi.so"})),
+        _in_sub(a_id, _tool_use("tu1", "Bash", {"command": "nm -D libdemo_op.so"})),
         _asst_text("主作用域文本"),  # 非 tool_use,不入 trace
     ]
     p = _write(tmp_path, recs)
@@ -426,16 +426,16 @@ def test_build_subagent_tool_trace_rec_agent_wins(tmp_path):
     recs = [
         # 主作用域有一个 Task 派发(id 与 a_id 无关——insight 路径的 ptid 非 tool_use id)
         _tool_use("tu_root", "task", {"subagent_type": "verifier", "prompt": "验收"}),
-        {"agent": "kernel-verifier", "parent_tool_use_id": a_id,
+        {"agent": "code-verifier", "parent_tool_use_id": a_id,
          "message": {"role": "assistant", "content": [
              {"type": "tool_use", "id": "tu2", "name": "Read",
-              "input": {"filePath": "docs/x/references/ttk-gen-contract.md"}}]}},
+              "input": {"filePath": "docs/x/references/demo-contract.md"}}]}},
     ]
     p = _write(tmp_path, recs)
     trace = build_subagent_tool_trace(p)
     assert len(trace) == 1
-    assert trace[0].agent == "kernel-verifier"  # rec.agent 优先
-    assert trace[0].input == {"filePath": "docs/x/references/ttk-gen-contract.md"}
+    assert trace[0].agent == "code-verifier"  # rec.agent 优先
+    assert trace[0].input == {"filePath": "docs/x/references/demo-contract.md"}
 
 
 def test_build_subagent_tool_trace_empty_when_no_subagents(tmp_path):

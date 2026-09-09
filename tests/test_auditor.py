@@ -2702,7 +2702,7 @@ class TestAuxSubagentRescue:
         )
         auditor = TranscriptAuditor()
         root_trace = [_tc("Read", "读 STATE.md")]
-        aux = [self._aux_tc("Bash", {"command": "nm -D libcust_opapi.so"}, agent="kernel-verifier", turn=118)]
+        aux = [self._aux_tc("Bash", {"command": "nm -D libdemo_op.so"}, agent="code-verifier", turn=118)]
 
         findings = auditor._judge_conditional(
             [_tool_inst(text="使用 nm 检查符号", tool_name="nm")], root_trace, "场景", "t.jsonl",
@@ -2712,7 +2712,7 @@ class TestAuxSubagentRescue:
         f = findings[0]
         assert f.verdict == AuditVerdict.PASS
         assert f.method == AuditMethod.PROGRAMMATIC
-        assert "kernel-verifier" in f.evidence
+        assert "code-verifier" in f.evidence
         assert "T118" in f.evidence
         assert "经派发执行" in f.evidence
         assert "主 trace 未命中" in f.evidence  # 与主路径 PASS 的 evidence 区分
@@ -2769,12 +2769,12 @@ class TestAuxSubagentRescue:
         auditor = TranscriptAuditor()
         aux = [self._aux_tc(
             "Read",
-            {"filePath": "/data1/x/.opencode/skills/ops-ttk/references/ttk-gen-contract.md"},
+            {"filePath": "/home/dev/skills/reporting/references/demo-contract.md"},
             agent="developer", turn=1531,
         )]
         findings = auditor._judge_conditional(
-            [_ref_inst(text="Use reference file: references/ttk-gen-contract.md",
-                       script_path="references/ttk-gen-contract.md")],
+            [_ref_inst(text="Use reference file: references/demo-contract.md",
+                       script_path="references/demo-contract.md")],
             [], "场景", "t.jsonl", aux_tool_trace=aux,
         )
         assert calls["n"] == 0
@@ -2800,19 +2800,19 @@ class TestAuxSubagentRescue:
 
     def test_aux_strict_no_text_mention_rescue(self, monkeypatch) -> None:
         """严格匹配:Write/Edit 文档**内容**里提及工具名不算执行(假救援防护)。
-        fc73 实测:子代理 Write STATE.md 内容含"ascendc-docs-gen"字样,被宽匹配
-        误判"已调用"——该 skill 实际从未被加载(收尾任务未开始)。"""
+        实测回归:子代理 Write 状态文件内容含"docs-gen"字样,被宽匹配误判
+        "已调用"——该 skill 实际从未被加载(收尾任务未开始)。"""
         def fake(prompt, *a, **k):
             return json.dumps([{"index": 0, "applicable": True, "reason": "该做"}])
 
         monkeypatch.setattr("sift.audit.auditor.call_claude", fake)
         auditor = TranscriptAuditor()
         aux = [self._aux_tc(
-            "Write", {"content": "# 工作流\n- [ ] 40. 调用 ascendc-docs-gen 生成文档"},
+            "Write", {"content": "# 工作流\n- [ ] 40. 调用 docs-gen 生成文档"},
             agent="state-generator",
         )]
         findings = auditor._judge_conditional(
-            [_tool_inst(text="调用 `ascendc-docs-gen", tool_name="ascendc-docs-gen")],
+            [_tool_inst(text="调用 `docs-gen", tool_name="docs-gen")],
             [], "场景", "t.jsonl", aux_tool_trace=aux,
         )
         assert findings[0].verdict == AuditVerdict.FAIL  # 文本提及不洗
@@ -2824,9 +2824,9 @@ class TestAuxSubagentRescue:
             "sift.audit.auditor.call_claude", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or "[]"
         )
         auditor = TranscriptAuditor()
-        aux = [self._aux_tc("Skill", {"skill": "ascendc-env-check"}, agent="developer", turn=7)]
+        aux = [self._aux_tc("Skill", {"skill": "env-check"}, agent="developer", turn=7)]
         findings = auditor._judge_conditional(
-            [_tool_inst(text="使用 ascendc-env-check skill", tool_name="ascendc-env-check")],
+            [_tool_inst(text="使用 env-check skill", tool_name="env-check")],
             [], "场景", "t.jsonl", aux_tool_trace=aux,
         )
         assert calls["n"] == 0

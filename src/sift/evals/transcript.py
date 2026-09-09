@@ -47,10 +47,11 @@ _BASH_WRITE_RE = re.compile(
 
 # A3(dispatch prompt 截断):task/Agent 派发类 tool_call 的 input(prompt/要求清单)是
 # 编排会话里主 agent 行为的核心证据,统一 [:200] 会掐掉要求清单 → 判官"看不见"派发
-# 内容(缺席式误判,实测 fc73 #73:LOG.md 要求在 prompt 第 ~600 字符处)。
-# 默认 2000(A3 实验结论:覆盖 92% 派发内容,token 2.2-4.0x、墙钟不变;见
-# docs/a3-truncation-experiment.md)。env SIFT_TASK_SUMMARY_LIMIT 可覆盖(实验消
-# 融用,如 =200 回旧行为);其他工具保持 200。
+# 内容(缺席式误判;实测样本里开发日志追加要求位于派发 prompt 第 ~600 字符处,被
+# 判"未要求")。
+# 默认 2000(实验结论:11 会话 5 档位对比——2000 覆盖 92% 派发内容,token 2.2-4.0x、
+# 墙钟不变;A3 型误判 500 档即翻案,"派发指令预置降级理由"类真实问题 ≥1000 才可见)。
+# env SIFT_TASK_SUMMARY_LIMIT 可覆盖(=200 回旧行为,实验消融用);其他工具保持 200。
 _DISPATCH_TOOL_NAMES = {"task", "agent"}
 _DISPATCH_SUMMARY_LIMIT = 2000
 
