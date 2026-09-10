@@ -88,11 +88,12 @@ from sift.concurrency import (
     configure_max_concurrent,
 )
 from sift.audit.noise import annotate_aggregate_noise, annotate_noise
+from sift.audit.provenance import analyze_provenance, has_provenance_evidence
 from sift.compliance.extractor import InstructionExtractor
 from sift.errors import SiftError
 from sift.evals.opencode import transcript_source
 from sift.execution.error_triage import classify_error
-from sift.models import InstructionCheck, InstructionSource, ToolCallRecord
+from sift.models import InstructionCheck, InstructionSource, ProvenanceAuditResult, ToolCallRecord
 from sift.models.audit_models import (
     AuditCategory,
     AuditFinding,
@@ -791,6 +792,7 @@ class TranscriptAuditor:
         all_findings: list[AuditFinding] = []
         transcript_names: list[str] = []
         transcript_sources: list[str] = []  # 与 transcript_names 同序;"cc"/"opencode"/...
+        provenance_results: dict[str, ProvenanceAuditResult] = {}
         boundary_traces: list[tuple[str, list]] = []  # 越界视图输入:(transcript 名, rebuild 的 tool_trace)
 
         for ti, tp in enumerate(transcripts, 1):
@@ -806,8 +808,16 @@ class TranscriptAuditor:
                 boundary_traces.append((tp.name, tool_trace))
             except SiftError as e:
                 # 坏/空 transcript:不崩,记 warning 跳过(其余 transcript 照常处理)。
+                # 未能重建有效 digest 时，声明对账与文件归因分析均跳过该记录。
                 warnings.append(f"{tp.name}: {e}")
                 continue
+
+            # v2 证据自动进入独立 provenance 区块。Analyzer 是纯本地确定性逻辑，
+            # 不改变既有 AuditFinding、coverage、PASS/FAIL 汇总或 exit code。
+            if has_provenance_evidence(digest):
+                provenance_result = analyze_provenance(digest)
+                if provenance_result.available:
+                    provenance_results[tp.name] = provenance_result
 
             derived = derive_declarations(digest, instructions)
             all_inst = instructions + derived
@@ -1083,6 +1093,7 @@ class TranscriptAuditor:
             duration_seconds=time.perf_counter() - _wall_start,
             stage_breakdown=stage_breakdown,
             unresolved_breakdown=unresolved_causes,
+            provenance=provenance_results,
         )
 
     def _judge_conditional(

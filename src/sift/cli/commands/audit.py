@@ -489,6 +489,23 @@ def audit(
             f"[dim](不构成违规判定;详见报告 boundary 区块)[/dim]"
         )
 
+    # 文件归因视图(v2):Analyzer 结果独立于声明遵循性 verdict；仅在存在可用
+    # provenance 证据时显示一行摘要，完整 findings/timeline 随 JSON 嵌入报告。
+    if report.provenance:
+        capture_count = sum(
+            result.get_count("capture_count")
+            for result in report.provenance.values()
+        )
+        effect_count = sum(
+            result.get_count("effect_count")
+            for result in report.provenance.values()
+        )
+        console.print(
+            f"文件归因: {len(report.provenance)} 个会话 · "
+            f"{capture_count} 个 capture · {effect_count} 个文件变更"
+            f"[dim](不参与声明 PASS/FAIL；详见报告 provenance 区块)[/dim]"
+        )
+
     # 改进建议一行(--suggest 产;渲染优先级 skipped_reason 先行——失败 ≠ 全怪模型)。
     sug = report.suggestions
     if sug is not None:

@@ -1,8 +1,20 @@
 """Tests for the deterministic provenance behaviour analyser."""
 
+import pytest
+
 from sift.audit.provenance import analyze_provenance
 from sift.evals.transcript import SessionDigest
 from sift.models import FileEffectRecord, ProvenanceEvent, ToolCallRecord
+
+
+@pytest.mark.parametrize("value,expected", [(None, 0), ("3", 0), (3.5, 0), (True, 0), (-1, 0), ([], 0), (0, 0), (3, 3)])
+def test_summary_counts_do_not_coerce_invalid_statistics(value, expected):
+    from sift.models import ProvenanceAuditResult
+
+    result = ProvenanceAuditResult(statistics={"capture_count": value})
+    assert result.get_count("capture_count") == expected
+    assert result.get_count("effect_count") == 0
+    assert result.statistics["capture_count"] == value
 
 
 def _effect(capture: str, path: str, *, quality: str = "observed", after: str | None = None):

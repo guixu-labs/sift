@@ -30,6 +30,8 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 
+from sift.models.provenance_audit_models import ProvenanceAuditResult
+
 
 class AuditVerdict(str, Enum):
     """单条指令的对账结论(五态)。
@@ -322,6 +324,9 @@ class AuditReport(BaseModel):
     # 分母;undeclared ≠ 违规(skill 声明通常不穷举工具),是二期行为基线的数据采集面。
     # 旧 report 无此字段 → 全默认(total_tools 0 → 渲染端不显)。
     boundary: BoundarySummary = Field(default_factory=BoundarySummary)
+    # 文件归因分析结果，按 transcript 文件名保存。该区块独立于 findings，
+    # 不参与声明 coverage、PASS/FAIL 汇总或 exit code；没有 v2 证据时为空。
+    provenance: dict[str, ProvenanceAuditResult] = Field(default_factory=dict)
     # 改进建议(audit.suggest.build_suggestions 产,--suggest 可选、默认关):对 FAIL
     # findings 做三类归因并起草改 skill/改声明建议;model_env 归因只透明计数不出建议。
     # **CLI 层后处理,引擎零感知**(run 内 compliance 不产)。None = 没跑(默认关 /

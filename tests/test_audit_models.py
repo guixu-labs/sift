@@ -13,6 +13,7 @@ from sift.models import (
     AuditMethod,
     AuditReport,
     AuditVerdict,
+    ProvenanceAuditResult,
 )
 
 
@@ -182,6 +183,17 @@ class TestAuditReport:
             findings=[self._make_finding()],
         )
         assert report.warnings == []
+
+    def test_provenance_default_and_roundtrip(self) -> None:
+        report = AuditReport(
+            skill_name="demo",
+            transcripts=["run.json"],
+            summary={"total": 0},
+            findings=[],
+            provenance={"run.json": ProvenanceAuditResult(available=True)},
+        )
+        restored = AuditReport.model_validate_json(report.model_dump_json())
+        assert restored.provenance["run.json"].available is True
 
     def test_summary_dict_holds_counts(self) -> None:
         summary = {"total": 3, "pass": 1, "fail": 1, "na": 1}

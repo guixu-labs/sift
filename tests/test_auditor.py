@@ -28,7 +28,8 @@ from sift.audit.auditor import (
     _judge_batch_with_retry, _RetryExhaustedType, _run_batches_concurrent,
 )
 from sift.audit.tool_match import count_tool_calls, match_tool_call
-from sift.models import InstructionCheck, ToolCallRecord
+from sift.models import InstructionCheck, ToolCallRecord, ProvenanceAuditResult
+from sift.evals.transcript import SessionDigest
 from sift.models.audit_models import (
     AuditCategory,
     AuditFinding,
@@ -1443,6 +1444,71 @@ class TestAuditAggregate:
             AuditCategory.OUTPUT,
         }
         assert len(report.findings) == 5  # 2 CONDITIONAL + 1 + 1 + 1
+
+
+def test_audit_attaches_available_provenance_without_changing_findings(tmp_path, monkeypatch) -> None:
+    """v2 digest 自动写入独立 provenance 区块，既有 findings 汇总保持不变。"""
+    transcript = tmp_path / "v2.jsonl"
+    transcript.write_text("placeholder", encoding="utf-8")
+    digest = SessionDigest(evidence_metadata={"version": 2})
+    calls: list[SessionDigest] = []
+
+    def fake_analyze(value: SessionDigest) -> ProvenanceAuditResult:
+        calls.append(value)
+        return ProvenanceAuditResult(
+            available=True,
+            statistics={"capture_count": 0},
+        )
+
+    monkeypatch.setattr("sift.audit.auditor.rebuild", lambda *args, **kwargs: ([], "", digest))
+    monkeypatch.setattr("sift.audit.auditor.analyze_provenance", fake_analyze)
+
+    report = TranscriptAuditor().audit("skill", "", [transcript])
+
+    assert calls == [digest]
+    assert list(report.provenance) == ["v2.jsonl"]
+    assert report.provenance["v2.jsonl"].available is True
+    assert report.summary["total"] == 0
+    assert report.findings == []
+
+
+@pytest.mark.parametrize("has_refs", [False, True])
+def test_audit_prechecks_provenance_without_losing_reference_only_evidence(tmp_path, monkeypatch, has_refs):
+    transcript = tmp_path / "session.jsonl"
+    digest = SessionDigest()
+    if has_refs:
+        from sift.models import FileEffectRecord
+        digest.evidence_refs = {"capture:test": FileEffectRecord(
+            path="a.py", evidence_ref="capture:test", quality="observed", capture_id="test",
+        )}
+    calls = []
+
+    def analyze(value):
+        calls.append(value)
+        return ProvenanceAuditResult(available=True)
+
+    monkeypatch.setattr("sift.audit.auditor.rebuild", lambda *args, **kwargs: ([], "", digest))
+    monkeypatch.setattr("sift.audit.auditor.analyze_provenance", analyze)
+    report = TranscriptAuditor().audit("skill", "", [transcript])
+    assert len(calls) == int(has_refs)
+    assert bool(report.provenance) == has_refs
+
+
+def test_failed_rebuild_skips_provenance(tmp_path, monkeypatch):
+    from sift.errors import SiftError
+
+    def rebuild(*args, **kwargs):
+        raise SiftError("invalid evidence")
+
+    def analyze(*args):
+        pytest.fail("failed rebuild must not reach analyzer")
+
+    monkeypatch.setattr("sift.audit.auditor.rebuild", rebuild)
+    monkeypatch.setattr("sift.audit.auditor.analyze_provenance", analyze)
+    report = TranscriptAuditor().audit("skill", "", [tmp_path / "bad.jsonl"])
+    assert report.provenance == {}
+    assert report.findings == []
+    assert any("invalid evidence" in warning for warning in report.warnings)
 
 
 class TestAuditNoiseWiring:
