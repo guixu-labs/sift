@@ -542,6 +542,48 @@ def test_init_append_feeds_existing_evals_to_generation(monkeypatch, tmp_path):
     assert captured["existing"][0].name == "OLD"  # 现有题喂进去了
 
 
+def test_init_transcript_append_focus_uses_existing_cases_and_skips_exact_duplicates(monkeypatch, tmp_path):
+    import json
+
+    sp = _skill_dir(tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(json.dumps({"message": {"role": "user", "content": "检查边界情况"}}) + "\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = EvalCase(id=1, name="旧题", prompt="旧请求", rationale="已覆盖正常情况")
+    (out / "evals.json").write_text(
+        EvalSet(skill_name="s", evals=[existing]).model_dump_json(indent=2), encoding="utf-8"
+    )
+    prompts = []
+
+    def fake_llm(self, prompt):
+        prompts.append(prompt)
+        duplicate = existing.model_dump(mode="json")
+        duplicate["id"] = 99
+        fresh = EvalCase(id=2, name="新题", prompt="新边界请求", rationale="检查边界情况")
+        return json.dumps({"skill_name": "s", "evals": [duplicate, fresh.model_dump(mode="json")]})
+
+    monkeypatch.setattr("sift.evals.generator.EvalInitGenerator._llm_call", fake_llm)
+    command = [
+        "init", str(sp), "--from-transcript", str(transcript),
+        "--append", "--focus", "edge-cases", "-o", str(out),
+    ]
+    first = runner.invoke(app, command)
+    assert first.exit_code == 0, first.output
+    assert "edge-cases" in prompts[0]
+    assert "旧请求" in prompts[0] and "已覆盖正常情况" in prompts[0]
+    assert "本次新增 1" in first.output
+    assert [case["prompt"] for case in json.loads((out / "evals.json").read_text())["evals"]] == [
+        "旧请求", "新边界请求",
+    ]
+
+    second = runner.invoke(app, command)
+    assert second.exit_code == 0, second.output
+    assert "新边界请求" in prompts[1]
+    assert "本次新增 0" in second.output
+    assert len(json.loads((out / "evals.json").read_text())["evals"]) == 2
+
+
 def test_init_append_no_existing_feeds_none(monkeypatch, tmp_path):
     """--append 但无已有 evals.json → 喂 None(退回软 focus directive,覆盖式行为不变)。"""
 
