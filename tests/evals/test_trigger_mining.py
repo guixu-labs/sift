@@ -80,6 +80,17 @@ def test_fact_layer_collects_untriggered_queries(tmp_path):
     assert got == ["帮我把这个崩溃日志的根因分析出来", "看看磁盘占用为什么这么高"]
 
 
+def test_fact_layer_ignores_child_agent_user_messages(tmp_path):
+    path = _write(tmp_path, [
+        _user("帮我分析这份日志"),
+        json.dumps({
+            "parent_tool_use_id": "dispatch-1",
+            "message": {"role": "user", "content": "子 agent 内部消息"},
+        }),
+    ])
+    assert mine_untriggered_queries(path, "my-skill") == ["帮我分析这份日志"]
+
+
 def test_fact_layer_window_not_global(tmp_path):
     """transcript 全局含本 skill 调用时,未触发的 query 仍要收(窗口而非全局判定)。"""
     name, _ = _skill()

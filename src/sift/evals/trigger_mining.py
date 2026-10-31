@@ -55,7 +55,7 @@ def _user_text(rec: dict) -> str:
     文本与 Skill 调用」,digest 的 user_turns 列表丢失了这个交错关系。
     """
     msg = rec.get("message") or {}
-    if msg.get("role") != "user":
+    if rec.get("parent_tool_use_id") or msg.get("role") != "user":
         return ""
     content = msg.get("content")
     if isinstance(content, str):

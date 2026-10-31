@@ -567,10 +567,18 @@ Output JSON ONLY:
         设计见 ``trigger_mining`` 模块 docstring。返回的 probe 无有效 id(init 层统一
         接续编号,同 ``generate_trigger_probes`` 约定)。
         """
+        return self.mine_trigger_probes_from_transcripts(skill_path, [transcript_path])
+
+    def mine_trigger_probes_from_transcripts(
+        self, skill_path: Path, transcript_paths: list[Path]
+    ) -> list[TriggerProbe]:
+        """Collect untriggered queries within each session, then filter once."""
         from sift.evals.trigger_mining import filter_near_miss, mine_untriggered_queries
 
         name, description, *_ = parse_skill_md(skill_path)
-        candidates = mine_untriggered_queries(Path(transcript_path), name)
+        candidates = list(dict.fromkeys(
+            query for path in transcript_paths for query in mine_untriggered_queries(Path(path), name)
+        ))
         if not candidates:
             return []
         verdicts = filter_near_miss(candidates, description, self._llm_call)
@@ -599,6 +607,8 @@ Output JSON ONLY:
         transcript_path: Path,
         on_heartbeat: Callable[[str], None] | None = None,
         kind: str | None = None,
+        *,
+        already_scoped: bool = False,
     ) -> EvalSet:
         from sift.evals.transcript import build_digest
 
@@ -606,7 +616,7 @@ Output JSON ONLY:
             raise SiftError(f"transcript 文件不存在: {transcript_path}")
         name, description, _content, frontmatter, body = parse_skill_md(skill_path)
         digest_path = transcript_path
-        if kind:
+        if kind and not already_scoped:
             # 多单元 transcript:只取本 skill/agent 被调用/被 dispatch 期间的段(kind 选锚点),
             # 拼成虚拟 transcript 再 build_digest → manifest 只含本单元文件,不串别单元的味。
             from sift.audit.slice import slice_transcript
@@ -651,6 +661,37 @@ Output JSON ONLY:
         self._flag_missing_rationale(eval_set)
         eval_set = enforce_manifest(eval_set, digest.manifest | skill_outputs)
         return merge_same_task_evals(eval_set)
+
+    def generate_from_run(
+        self,
+        skill_path: Path,
+        sessions: list[tuple[str, Path]],
+        kind: str | None,
+        on_heartbeat: Callable[[str], None] | None = None,
+    ) -> EvalSet:
+        """Mine each selected session separately, then combine its candidate cases."""
+        name = parse_skill_md(skill_path)[0]
+        cases: list[EvalCase] = []
+        for index, (session_id, transcript_path) in enumerate(sessions, 1):
+            if on_heartbeat:
+                on_heartbeat(f"正在从 session {index}/{len(sessions)} ({session_id}) 挖题…")
+            result = self.generate_from_transcript(
+                skill_path, transcript_path, on_heartbeat=on_heartbeat, kind=kind, already_scoped=True
+            )
+            cases.extend(result.evals)
+        normal_prompts = {
+            (case.prompt or "").strip()
+            for case in cases
+            if not any(flag.startswith("degraded:") for flag in case.flags or [])
+        }
+        cases = [
+            case for case in cases
+            if not (
+                (case.prompt or "").strip() in normal_prompts
+                and any(flag.startswith("degraded:") for flag in case.flags or [])
+            )
+        ]
+        return merge_same_task_evals(EvalSet(skill_name=name, evals=cases))
 
     def _llm_call(self, prompt: str) -> str:
         """call_claude + 累加 token/耗时到实例(init 终端显示用)。RuntimeError 透传调用方处理。"""
