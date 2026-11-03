@@ -70,6 +70,7 @@ class EvalInitGenerator:
         config: EvalConfig | None = None,
         modes: list[str] | None = None,
         focus: str | None = None,
+        existing_evals: list[EvalCase] | None = None,
     ) -> None:
         self.model = model
         self.timeout = timeout
@@ -79,6 +80,7 @@ class EvalInitGenerator:
         self._llm_usage: dict = {}
         self._llm_duration: float = 0.0
         self.focus = focus
+        self.existing_evals = existing_evals
 
     @property
     def init_warnings(self) -> list[str]:
@@ -626,7 +628,9 @@ Output JSON ONLY:
             raise SiftError("transcript 未产出可用内容(无 user turn 也无文件)")
         skill_outputs = extract_skill_outputs(body)
         source = PromptSource(name=name, description=description, content=body, frontmatter=frontmatter)
-        prompt = build_transcript_prompt(source, digest, skill_outputs, kind)
+        prompt = build_transcript_prompt(
+            source, digest, skill_outputs, kind, focus=self.focus, existing_evals=self.existing_evals
+        )
         # mining 是单次大-prompt LLM 调用,常 1-5 分钟;"Mining…"后长时间静默像卡死。
         # 加心跳(独立线程,call_claude 阻塞期间每 20s 报一次仍在跑),同 audit/path-1 进度诉求。
         stop = threading.Event()

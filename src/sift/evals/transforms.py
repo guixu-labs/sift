@@ -830,7 +830,13 @@ def extract_skill_outputs(body: str) -> set[str]:
 
 
 def build_transcript_prompt(
-    source: PromptSource, digest, skill_outputs: set[str] | None = None, kind: str | None = None
+    source: PromptSource,
+    digest,
+    skill_outputs: set[str] | None = None,
+    kind: str | None = None,
+    *,
+    focus: str | None = None,
+    existing_evals: list[EvalCase] | None = None,
 ) -> str:
     name = source.name
     description = source.description
@@ -873,6 +879,9 @@ def build_transcript_prompt(
             '塞项、这个 PR 能不能合"。\n'
         )
     )
+    directive = supplement_directive(focus, existing_evals)
+    if directive:
+        lines.append("\n" + directive)
     seg_head = "## Agent system prompt" if is_agent else "## SKILL"
     lines.append((f"\n{seg_head}\nname: {name}\ndescription: {description}\n\n{body[:6000]}\n"))
     return "".join(lines)
