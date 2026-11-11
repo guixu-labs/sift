@@ -9,7 +9,7 @@ from typing import NamedTuple
 
 def load_template(agent: str) -> str:
     """读取随包提供的评分 agent 模板；未安装模板时保留空模板降级。"""
-    path = Path(__file__).parent.parent.parent.parent / "agents" / f"{agent}.md"
+    path = Path(__file__).parent / "templates" / f"{agent}.md"
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
