@@ -114,6 +114,7 @@ from sift.audit.noise import annotate_aggregate_noise, annotate_noise
 from sift.audit.preparation import apply_headlines_cached, refine_instructions_cached
 from sift.audit.provenance import analyze_provenance, has_provenance_evidence
 from sift.audit.rebuild import rebuild
+from sift.audit.text_coverage import build_text_coverage
 from sift.audit.tool_match import (
     count_tool_calls,
     extract_first_balanced,
@@ -1708,7 +1709,9 @@ class TranscriptAuditor:
         return _finalize_audit(
             skill_name,
             context,
-            AuditFinishOptions(order_endpoints, declared_tools, refine_dropped_count, features, _wall_start),
+            AuditFinishOptions(
+                order_endpoints, declared_tools, refine_dropped_count, features, _wall_start, skill_body
+            ),
         )
 
     def _prepare_audit_instructions(
@@ -2606,6 +2609,10 @@ def _finalize_audit(skill_name: str, context: AuditContext, details: AuditFinish
     by_instruction = annotate_aggregate_noise(by_instruction)
     # 声明覆盖视图(纯 post-judge 元数据:dedup/seq 已定,seqs 交叉引用可用)。
     coverage = aggregate_coverage(state.findings)
+    # 声明文本覆盖视图(纯 post-judge 元数据:对账结果按 source_excerpt 回指投影回
+    # 声明原文单元,保守最低态三色;skill_body 一并快照进报告——渲染**对账时版本**,
+    # 声明事后被编辑才不会张冠李戴)。空 body(旧调用方不传)→ 全 0,渲染端不显。
+    text_coverage = build_text_coverage(details.skill_body, state.findings)
     # 越界视图(一期信息性:领域工具对账,零 LLM 零缓存;只喂声明侧 instructions,
     # 不喂 derived——拿被审对象自己声明自己会循环论证)。declared_tools = 调用方
     # 从声明 frontmatter 抽的工具白名单(第四源,并集兜底)。
@@ -2627,6 +2634,8 @@ def _finalize_audit(skill_name: str, context: AuditContext, details: AuditFinish
         findings=state.findings,
         by_instruction=by_instruction,
         coverage=coverage,
+        text_coverage=text_coverage,
+        skill_body=details.skill_body,
         boundary=boundary,
         warnings=state.warnings,
         refine_dropped_count=details.refine_dropped_count,

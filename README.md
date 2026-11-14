@@ -218,7 +218,7 @@ sift audit path/to/skill/ --transcript opencode-session.json          # opencode
 sift audit path/to/skill/ --db opencode.db                            # 直接给 opencode .db(自动 list/export/audit)
 ```
 
-报告除逐条 verdict 外还给**声明覆盖视图**（`coverage`）：本次会话覆盖了声明的多少——按声明章节分组列未覆盖指令（covered=任一 PASS/FAIL / uncovered=全 N/A / unknown=没判成），一眼看清这批对账的证据面；外加**工具对账视图**（`boundary`，信息性）：轨迹里调过的领域工具（内置原语不算）× 声明工具要求逐个对账，未命中的列出来——未声明 ≠ 违规，只是给「声明之外还动了什么」一个诚实的数据面。
+报告除逐条 verdict 外还给**声明覆盖视图**（`coverage`）：本次会话覆盖了声明的多少——按声明章节分组列未覆盖指令（covered=任一 PASS/FAIL / uncovered=全 N/A / unknown=没判成），一眼看清这批对账的证据面；**声明文本覆盖视图**（`text_coverage`）：把覆盖状态沿「指令 → 声明原文单元」回指投影回 SKILL.md 原文，bullet/段落/代码块逐段三色（绿=已触达 / 黄=未验证 / 灰=未建模），双指标分报（`coverage_rate`=covered/modeled，未建模不进分母；`modeled_ratio`=modeled/total_units，抽取完整度自我坦白），报告同时快照 `skill_body`（对账时刻的声明原文，防事后编辑张冠李戴）；外加**工具对账视图**（`boundary`，信息性）：轨迹里调过的领域工具（内置原语不算）× 声明工具要求逐个对账，未命中的列出来——未声明 ≠ 违规，只是给「声明之外还动了什么」一个诚实的数据面。
 
 > `--max-concurrent N`（或 env `SIFT_MAX_CONCURRENT`）：**固定** LLM 判定并发上限（关自适应）；不设则默认 **AIMD 自适应**（动态探后端容量边界，适配不同模型/服务商）。env `SIFT_ADAPTIVE_CONCURRENCY=0` 显式关自适应。大声明 / 低内存时用 `--max-concurrent` 调小。
 

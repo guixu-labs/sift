@@ -46,8 +46,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      # requirements.lock 锁全量依赖(编译自 pyproject,含 dev extra)——依赖不再
+      # 每次 run 重解析,上游 breaking 不再炸 CI;栈保持 pip/setuptools
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
 
       - name: Test
         run: pytest -q

@@ -135,6 +135,21 @@ def _group_instruction_findings(findings):
     return groups
 
 
+def coverage_status(pass_count: int, fail_count: int, na_count: int, unresolved: int, indeterminate: int) -> str:
+    """指令覆盖三态判定(covered/uncovered/unknown)——覆盖视图与文本覆盖视图共用,单一真身防漂移。
+
+    优先级(与 InstructionCoverage.status 文档一致):
+    - covered:任一 transcript PASS 或 FAIL(会话碰过这条规则,守没守另算);
+    - uncovered:全部 transcript 都 N/A 且无没判成/判不准(规则在、场景从未触发);
+    - unknown:其余(N/A+UNRESOLVED 混合 / 纯 UNRESOLVED / 纯 INDETERMINATE)。
+    """
+    if pass_count or fail_count:
+        return "covered"
+    if na_count and not (unresolved or indeterminate):
+        return "uncovered"
+    return "unknown"
+
+
 def aggregate_coverage(findings: list[AuditFinding]) -> CoverageSummary:
     """声明覆盖视图:按声明分组统计指令被 transcript(s) 触达多少(纯函数、不调 LLM)。
 
@@ -187,12 +202,7 @@ def _build_coverage_sections(groups):
     sections: dict[str, dict] = {}
     for g in groups.values():
         total = g["pass"] + g["fail"] + g["na"] + g["unresolved"] + g["indeterminate"]
-        if g["pass"] or g["fail"]:
-            status = "covered"
-        elif g["na"] and not (g["unresolved"] or g["indeterminate"]):
-            status = "uncovered"
-        else:
-            status = "unknown"
+        status = coverage_status(g["pass"], g["fail"], g["na"], g["unresolved"], g["indeterminate"])
         sec = sections.setdefault(
             g["section"],
             {"section": g["section"], "covered": 0, "uncovered": 0, "unknown": 0, "instructions": []},

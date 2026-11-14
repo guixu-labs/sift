@@ -241,6 +241,66 @@ class CoverageSummary(BaseModel):
     sections: list[SectionCoverage] = Field(default_factory=list)
 
 
+class TextUnitInstruction(BaseModel):
+    """回指到该文本单元的一条指令(轻量引用:状态 + 人话标题)。
+
+    指令级明细(pass/fail 计数、seqs 交叉引用)在 coverage.sections 里,本结构只带
+    声明原文覆盖图 hover/展开所需的最低信息——判断该单元颜色够用,不重复存。
+    """
+
+    instruction_text: str
+    headline: str = ""
+    status: str  # "covered" | "uncovered" | "unknown"(与 InstructionCoverage 同口径)
+
+
+class TextCoverageUnit(BaseModel):
+    """声明原文的一个文本单元(声明原文覆盖图的一行)。
+
+    - ``kind`` 四态:``heading``(结构行,不进分母、无色)/ ``bullet`` / ``paragraph`` /
+      ``codeblock``。bullet 续行规则与 extractor._bullet_excerpt 逐字一致(缩进 >
+      基准缩进延续、空行终止)——切分与抽取同规,source_excerpt 回指命中率才有根。
+    - ``state`` 三态:``covered``(该单元全部指令已触达)/ ``uncovered``(有指令但存在
+      未触发或判不全——保守最低态)/ ``unmodeled``(没有指令回指到——非规则文本或
+      抽取盲区,**不猜**);heading 为空串(结构行)。
+    - ``start``/``end``:单元在 skill_body 里的字符区间(诊断/定位用)。渲染以 ``text``
+      为真身——JS 按区间切片有 UTF-16 代理对偏移风险(声明常含 ✅ 之类 emoji),
+      直接存原文不切。
+    """
+
+    kind: str  # "heading" | "bullet" | "paragraph" | "codeblock"
+    start: int = 0
+    end: int = 0
+    text: str = ""
+    state: str = ""
+    # 该单元所属标题(codeblock 专属:fence 开块时所处的 heading,OUTPUT_FORMAT 按
+    # 它回指)。其余 kind 恒空——标题归属看相邻 heading 单元,不冗余存。
+    heading: str = ""
+    instructions: list[TextUnitInstruction] = Field(default_factory=list)
+
+
+class TextCoverageSummary(BaseModel):
+    """声明文本覆盖视图总聚合(对账结果投影回声明原文,audit.text_coverage 产)。
+
+    双指标、两种含义不混在一个数里:
+    - ``coverage_rate`` = covered / modeled(可评文本覆盖率)——**未建模不进分母**:
+      一个数字混进「执行触达」与「抽取召回」两种含义就没法解读;
+    - ``modeled_ratio`` = modeled / total_units(建模完整度)——声明正文里有多大比例
+      被抽成了可对账指令,是抽取质量的自我坦白(大段灰 = 该治理声明写法了)。
+    ``unmapped_instructions``:抽出来了但没落回任何文本单元的指令(如类别级参考),
+    诚实计数不静默吞。heading 不进 total_units。旧 report 无此字段 → 全默认
+    (total_units 0 → 渲染端不显)。
+    """
+
+    total_units: int = 0
+    covered: int = 0
+    uncovered: int = 0
+    unmodeled: int = 0
+    coverage_rate: float = 0.0  # covered/modeled;modeled = covered+uncovered;modeled 0 → 0.0
+    modeled_ratio: float = 0.0  # modeled/total_units;total 0 → 0.0
+    unmapped_instructions: list[str] = Field(default_factory=list)
+    units: list[TextCoverageUnit] = Field(default_factory=list)
+
+
 class ToolUsageEntry(BaseModel):
     """越界视图单个领域工具的对账行(audit.boundary.aggregate_boundary 产)。
 
@@ -327,6 +387,17 @@ class AuditReport(BaseModel):
     # uncovered=全 N/A(规则在、场景没触发);unknown=只有没判成/判不准。反推(derived)指令
     # 不计(不是声明规则、构造上偏 PASS)。旧 report 无此字段 → 全默认(total 0 → 渲染端不显)。
     coverage: CoverageSummary = Field(default_factory=CoverageSummary)
+    # 声明文本覆盖视图(aggregate 旁的 text_coverage 模块产,纯 post-judge 元数据、不进
+    # 任何 gate):对账结果按 source_excerpt 回指上卷到声明原文的 bullet/段落/代码块,
+    # 三态着色(covered=该段指令全部触达 / uncovered=有指令未验证 / unmodeled=没抽出
+    # 指令)。双指标:coverage_rate=covered/modeled、modeled_ratio=modeled/total_units。
+    # 旧 report 无此字段 → 全默认(total_units 0 → 渲染端不显)。
+    text_coverage: TextCoverageSummary = Field(default_factory=TextCoverageSummary)
+    # 对账时刻的声明正文快照。文本覆盖视图渲染**对账时版本**——声明事后被编辑,
+    # 渲染现取会张冠李戴(指令回指的是旧文),故报告里存原文。旧 report 无此字段
+    # → 空串(渲染端无 text_coverage 一并不显)。大小代价:正文本身 + 单元 text,
+    # 声明文档量级 KB,可接受。
+    skill_body: str = ""
     # 越界视图(audit.boundary.aggregate_boundary 产,一期纯信息性、不进任何 gate):
     # 轨迹里的领域工具动作 × 声明工具要求 对账,未声明的列出来供人看。builtin 不进
     # 分母;undeclared ≠ 违规(skill 声明通常不穷举工具),是二期行为基线的数据采集面。
