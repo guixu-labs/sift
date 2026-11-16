@@ -125,6 +125,9 @@ class AuditFinishOptions(NamedTuple):
     refine_dropped_count: int
     features: AuditFeatures
     wall_start: float
+    # 对账时刻的声明正文快照(text_coverage 切分回指 + report.skill_body 落盘用)。
+    # 默认空串向后兼容:eval 内 compliance 等旧调用方不传则文本覆盖视图全 0(不显)。
+    skill_body: str = ""
 
 
 class JudgeBatch(NamedTuple):
