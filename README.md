@@ -400,6 +400,12 @@ Exit code（各命令语义不同）：
 pytest tests/ -v
 ```
 
+CI 从 `requirements.lock` 安装依赖（全量锁死，不再每次 run 重解析——上游 breaking 不炸流水线）。**依赖变动后刷新锁**再提交：
+
+```bash
+uv pip compile pyproject.toml --extra dev -p 3.10 -o requirements.lock
+```
+
 ## 开发：提交门禁
 
 仓库带一套禁词提交门禁：staged **新增行** 与 commit message 过禁词清单就拦（只查新增行不扫存量——动到哪行修哪行）。
