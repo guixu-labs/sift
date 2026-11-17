@@ -11,6 +11,7 @@ import typer
 
 from sift.cli.main import app, console
 from sift.cli.options import options_command
+from sift.gating.models import GateResult
 from sift.gating.verdict import evaluate_gate
 
 
@@ -75,18 +76,25 @@ def gate(cli_options: GateCommandOptions):
             raise typer.Exit(code=2) from exc
         baseline_ids = {e["id"] for e in bdata.get("evals", []) if isinstance(e, dict) and "id" in e}
 
-    result = evaluate_gate(
-        benchmark,
-        min_win_rate=cli_options.min_win_rate,
-        min_valid=cli_options.min_valid,
-        programmatic_guard=not cli_options.no_programmatic_guard,
-        candidate=cli_options.candidate,
-        must_pass_ids=must_pass_ids or None,
-        baseline_ids=baseline_ids,
-        strict_drift=cli_options.strict_drift,
-    )
-    result.artifact = str(cli_options.benchmark_path)
+    try:
+        result = evaluate_gate(
+            benchmark,
+            min_win_rate=cli_options.min_win_rate,
+            min_valid=cli_options.min_valid,
+            programmatic_guard=not cli_options.no_programmatic_guard,
+            candidate=cli_options.candidate,
+            must_pass_ids=must_pass_ids or None,
+            baseline_ids=baseline_ids,
+            strict_drift=cli_options.strict_drift,
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+    _write_gate_result(cli_options, result)
 
+
+def _write_gate_result(cli_options: GateCommandOptions, result: GateResult) -> None:
+    result.artifact = str(cli_options.benchmark_path)
     gate_json_path = cli_options.out or (cli_options.benchmark_path.parent / "gate.json")
     gate_json_path.write_text(
         json.dumps(result.model_dump(mode="json"), indent=2, ensure_ascii=False),

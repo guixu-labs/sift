@@ -13,11 +13,13 @@ class AxisVerdict(BaseModel):
     verdict: str  # "PASS" | "FAIL" | "N/A"(applicable=False 不适用 / applicable=True 信号不足→最终 UNCLEAR)
     reason: str
     applicable: bool = True
-    delta: float | None = None  # programmatic
-    win_rate: float | None = None  # comparison(tie-排除)
-    decisive: int | None = None  # comparison(a_wins + b_wins)
-    a_wins: int | None = None
-    b_wins: int | None = None
+    delta: float | None = None  # programmatic: candidate-relative (B is sign-inverted)
+    raw_delta: float | None = None  # programmatic: original benchmark A-B delta
+    win_rate: float | None = None  # comparison: candidate wins / decisive
+    decisive: int | None = None  # comparison: raw A wins + raw B wins; ties excluded
+    a_wins: int | None = None  # comparison: raw benchmark side A count
+    b_wins: int | None = None  # comparison: raw benchmark side B count
+    candidate_wins: int | None = None  # comparison: wins for the selected candidate
     ties: int | None = None
     failed_ids: list[int] | None = None  # must_pass 轴:未通过的 eval id(结构化);其它轴 None
 

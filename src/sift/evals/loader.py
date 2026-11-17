@@ -27,12 +27,15 @@ class EvalLoader:
             if "id" not in raw:
                 raise EvalValidationError("Each eval must have an 'id'")
             if "prompt" not in raw or not raw["prompt"]:
-                raise EvalValidationError(f"Eval {raw.get('id', '?')}: 'prompt' must be non-empty")
-            eid = raw["id"]
+                raise EvalValidationError(
+                    f"Eval {raw.get('id', '?')}: 'prompt' must be non-empty"
+                )
+            case = EvalCase(**raw)
+            eid = case.id
             if eid in seen_ids:
                 raise EvalValidationError(f"Duplicate eval id: {eid}")
             seen_ids.add(eid)
-            cases.append(EvalCase(**raw))
+            cases.append(case)
 
         # trigger_probes 段(可选,纯 scoring 卷无此段 → []):逐条校验后透传,
         # 否则 loader 重建 EvalSet 时会丢掉它(inspect/freeze 等走 loader 的路径就看不到)。
@@ -42,14 +45,19 @@ class EvalLoader:
             for req in ("id", "prompt", "expect_trigger"):
                 if not (req not in raw_tp):
                     continue
-                raise EvalValidationError(f"Trigger probe {raw_tp.get('id', '?')}: missing '{req}'")
-            tpid = raw_tp["id"]
+                raise EvalValidationError(
+                    f"Trigger probe {raw_tp.get('id', '?')}: missing '{req}'"
+                )
+            probe = TriggerProbe(**raw_tp)
+            tpid = probe.id
             if tpid in seen_tp_ids:
                 raise EvalValidationError(f"Duplicate trigger probe id: {tpid}")
             seen_tp_ids.add(tpid)
-            trigger_probes.append(TriggerProbe(**raw_tp))
+            trigger_probes.append(probe)
 
-        return EvalSet(skill_name=data["skill_name"], evals=cases, trigger_probes=trigger_probes)
+        return EvalSet(
+            skill_name=data["skill_name"], evals=cases, trigger_probes=trigger_probes
+        )
 
     def load(self, path: Path) -> EvalSet:
         if not path.exists():

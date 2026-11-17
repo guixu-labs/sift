@@ -610,7 +610,7 @@ sift trigger path/to/skill/ --evals path/to/evals.json --model claude-sonnet-5
 
 **判定**：每条 probe 跨 N runs 算 `trigger_rate = fired 次数 / runs`，阈值 0.5 二值化 → PASS / FAIL；spawn 失败 / 超时 / **cc 非零退出且没触发**（限流 / 后端不可用：cc 实测 exit 1 + 错误打 stdout、stderr 空，`run_trigger` 不 raise 而返正常输出）→ 该 probe = `UNRESOLVED`（**不进率分母**、`trigger_rate` 置 `null`，宁少报不乱报）。聚合**分开报**（各带样本量）：`recall` = should-trigger 方向均值；`false_trigger_rate` = should-not 方向均值——两者是**不同失效模式、不合成一个分**。某方向 0 probe → 对应率 `null`（N/A，不是假 0.0）。
 
-**分层诊断（纯诊断，主指标之外）**：每条 probe 报告期再标两个派生维度（不进 evals.json）——`phrase_type`（`literal` 词面命中 / `paraphrase` 语义改写，由 anti-leakage 子串检查定）+ `length_bucket`（`short` / `medium` / `long`，按 prompt 字符数）。`trigger-report.json` 的 `breakdown` 字段把 `recall` / `false_trigger_rate` 再按这两个维度切：例如「词面命中 recall 90% · 语义改写 recall 40%」→ cc 主要靠字面匹配触发，不是真懂。终端打一行 `分层 recall`，HTML 报告给两维度 × 两方向完整分层（详见 [handbook](docs/sift-handbook.md)）。
+**分层诊断（纯诊断，主指标之外）**：每条 probe 报告期再标两个派生维度（不进 evals.json）——`phrase_type`（`literal` 词面命中 / `paraphrase` 语义改写，由 anti-leakage 子串检查定）+ `length_bucket`（`short` / `medium` / `long`，按 prompt 字符数）。`trigger-report.json` 的 `breakdown` 字段把 `recall` / `false_trigger_rate` 再按这两个维度切：例如「词面命中 recall 90% · 语义改写 recall 40%」→ cc 主要靠字面匹配触发，不是真懂。终端打一行 `分层 recall`，HTML 报告给两维度 × 两方向完整分层（详见 [handbook](sift-handbook.md)）。
 
 > **诊断定位、无门禁**：**无 gate / 不出 exit-code 判决**（纯诊断）。`trigger-report.json` 是独立 artifact，**不并入 `benchmark.json`**。用 [`init --trigger-probes`](#init--初始化评测定义) 生成探题。`description_hash` = sha256(frontmatter `description`)[:16]——锚定触发判定唯一依赖的输入，跨版本对比时判断 recall 变化是否源于 description 改动。成本：每 probe = 1 次 cc spawn（比 `eval` 轻——无 with/without 双 spawn、无 grader、无 compliance judge）。
 

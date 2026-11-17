@@ -1,7 +1,6 @@
-# Portions adapted from Anthropic skill-creator: Copyright 2026 Anthropic, PBC.
-# These third-party portions remain licensed under the Apache License, Version 2.0.
-# See LICENSES/Apache-2.0.txt and NOTICE.md for scope and modifications.
-# Historical skill-creator derivation is recorded in NOTICE.md.
+# Historical skill-creator derivation is recorded in packages/sift/NOTICE.md.
+# Run discovery and preview encoding were subsequently reimplemented for Sift.
+# Historical skill-creator derivation is recorded in packages/sift/NOTICE.md.
 # Run discovery and preview encoding were subsequently reimplemented for Sift.
 """Report generator — produces self-contained HTML from evaluation data."""
 
@@ -22,6 +21,7 @@ from pathlib import Path
 
 from sift.executables import resolve_executable
 from sift.execution.error_triage import classify_error
+from sift.reporting.embedded_data import dumps_for_script
 from sift.text_output import print_text
 
 METADATA_FILES = {"transcript.md", "user_notes.md", "metrics.json"}
@@ -139,6 +139,16 @@ def _build_run(root: Path, run_dir: Path) -> dict | None:
     return record
 
 
+def _component_number(component: str) -> int:
+    try:
+        return int(component.split("-")[1])
+    except (ValueError, IndexError):
+        logging.getLogger(__name__).debug(
+            "Optional operation failed; continuing with fallback", exc_info=True
+        )
+        return 0
+
+
 def _run_location(run_dir: Path, root: Path) -> tuple[int, str, int]:
     """Read config and numeric identifiers from either supported run layout."""
     parts = run_dir.relative_to(root).parts
@@ -148,29 +158,14 @@ def _run_location(run_dir: Path, root: Path) -> tuple[int, str, int]:
 
     if len(parts) >= 3:
         config = parts[0]
-        try:
-            eval_id = int(parts[1].split("-")[1])
-        except (ValueError, IndexError):
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
-        try:
-            run_number = int(parts[-1].split("-")[1])
-        except (ValueError, IndexError):
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        eval_id = _component_number(parts[1])
+        run_number = _component_number(parts[-1])
     elif len(parts) >= 2:
         config = parts[0]
-        try:
-            eval_id = int(parts[0].split("-")[1])
-        except (ValueError, IndexError):
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
-        try:
-            run_number = int(parts[-1].split("-")[1])
-        except (ValueError, IndexError):
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        eval_id = _component_number(parts[0])
+        run_number = _component_number(parts[-1])
     elif len(parts) >= 1:
-        try:
-            run_number = int(parts[-1].split("-")[1])
-        except (ValueError, IndexError):
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        run_number = _component_number(parts[-1])
     return eval_id, config, run_number
 
 
@@ -189,7 +184,9 @@ def _run_prompt(root: Path, eval_id: int, run_dir: Path) -> tuple[int, str]:
             if supplies_eval_id:
                 eval_id = metadata.get("eval_id", eval_id)
         except Exception:
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+            logging.getLogger(__name__).debug(
+                "Optional operation failed; continuing with fallback", exc_info=True
+            )
     return eval_id, prompt
 
 
@@ -226,7 +223,9 @@ def _embed_file(path: Path) -> dict:
             return _read_preview(path, kind, mime)
         except Exception:
             if kind != "binary":
-                logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+                logging.getLogger(__name__).debug(
+                    "Optional operation failed; continuing with fallback", exc_info=True
+                )
     return {"name": path.name, "type": "error", "content": "Could not read file"}
 
 
@@ -254,7 +253,9 @@ def _load_vet_report(workspace: Path) -> dict | None:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+            logging.getLogger(__name__).debug(
+                "Optional operation failed; continuing with fallback", exc_info=True
+            )
     return None
 
 
@@ -266,7 +267,9 @@ def _load_gate_verdict(root: Path) -> dict | None:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+            logging.getLogger(__name__).debug(
+                "Optional operation failed; continuing with fallback", exc_info=True
+            )
     return None
 
 
@@ -325,7 +328,9 @@ def _aggregate_compliance(runs: list[dict]) -> list[dict]:
                     "fail": sum(1 for f in validated if f.verdict == AuditVerdict.FAIL),
                     "na": sum(1 for f in validated if f.verdict == AuditVerdict.NA),
                     "unresolved": sum(1 for f in validated if f.verdict == AuditVerdict.UNRESOLVED),
-                    "indeterminate": sum(1 for f in validated if f.verdict == AuditVerdict.INDETERMINATE),
+                    "indeterminate": sum(
+                        1 for f in validated if f.verdict == AuditVerdict.INDETERMINATE
+                    ),
                 },
                 "by_instruction": [a.model_dump(mode="json") for a in ai],
                 # 声明覆盖视图(同一 findings 池的姊妹聚合):这批考卷实测触达了声明的多大
@@ -489,14 +494,16 @@ class ReportGenerator:
             "compliance_aggregate": _aggregate_compliance(runs),
             "previous": previous,
             "previous_outputs": prev_outputs,
-            "previous_delta": _compute_previous_delta(benchmark, _load_previous_benchmark(workspace)),
+            "previous_delta": _compute_previous_delta(
+                benchmark, _load_previous_benchmark(workspace)
+            ),
             "benchmark": benchmark,
             "scorecard": scorecard,
             "vet_report": _load_vet_report(workspace),
             "gate": _load_gate_verdict(workspace),
         }
 
-        json_data = json.dumps(data, ensure_ascii=False)
+        json_data = dumps_for_script(data)
         html = template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {json_data};")
 
         return html
@@ -513,7 +520,11 @@ class ReportGenerator:
         output_path.write_text(html, encoding="utf-8")
 
     def serve(
-        self, workspace: Path, port: int = 8080, benchmark: dict | None = None, open_browser: bool = False
+        self,
+        workspace: Path,
+        port: int = 8080,
+        benchmark: dict | None = None,
+        open_browser: bool = False,
     ) -> None:
         gen = self
 
@@ -543,7 +554,9 @@ class ReportGenerator:
             server.server_close()
 
 
-def _write_http_response(handler: BaseHTTPRequestHandler, status: int, html: str | None = None) -> None:
+def _write_http_response(
+    handler: BaseHTTPRequestHandler, status: int, html: str | None = None
+) -> None:
     handler.send_response(status)
     headers = {} if html is None else {"Content-Type": "text/html; charset=utf-8"}
     for name, value in headers.items():
@@ -560,7 +573,9 @@ def _kill_port(port: int) -> None:
         for pid in _listening_processes(port):
             _terminate_port_process(pid)
     except Exception:
-        logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        logging.getLogger(__name__).debug(
+            "Optional operation failed; continuing with fallback", exc_info=True
+        )
 
 
 def _listening_processes(port: int) -> list[str]:
@@ -574,12 +589,16 @@ def _terminate_port_process(pid):
     try:
         process_id = int(pid)
     except ValueError:
-        logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        logging.getLogger(__name__).debug(
+            "Optional operation failed; continuing with fallback", exc_info=True
+        )
         return
     try:
         os.kill(process_id, signal.SIGTERM)
     except ProcessLookupError:
-        logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
+        logging.getLogger(__name__).debug(
+            "Optional operation failed; continuing with fallback", exc_info=True
+        )
 
 
 def _read_optional_run_json(path: Path):
@@ -589,5 +608,7 @@ def _read_optional_run_json(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        logging.getLogger(__name__).debug("Could not read optional run artifact %s", path, exc_info=True)
+        logging.getLogger(__name__).debug(
+            "Could not read optional run artifact %s", path, exc_info=True
+        )
         return None

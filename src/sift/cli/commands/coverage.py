@@ -79,7 +79,7 @@ def coverage(cli_options: CoverageCommandOptions):
                 skill_path, eval_set, model=cli_options.model, timeout=cli_options.timeout, kind=cli_options.kind
             )
 
-        out_dir = cli_options.output or (skill_path / "evals")
+        out_dir = cli_options.output or (base / "evals")
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "coverage-report.json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
 

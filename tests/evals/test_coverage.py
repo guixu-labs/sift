@@ -118,7 +118,7 @@ def test_analyze_coverage_agent_kind_uses_agent_wording(monkeypatch, tmp_path):
 
 
 def test_coverage_agent_md_default_path(monkeypatch, tmp_path):
-    """coverage 对 agent .md 默认找 parent/evals/evals.json(.md→parent 路径修),不打「不存在」警告。"""
+    """Agent coverage defaults both input and reports to the declaration's parent/evals."""
     runner = CliRunner()
     adir = tmp_path / "pr-reviewer"
     adir.mkdir()
@@ -134,9 +134,33 @@ def test_coverage_agent_md_default_path(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cov_cmd, "analyze_coverage", fake_analyze)
 
-    r = runner.invoke(cov_cmd.app, ["coverage", str(agent), "-o", str(tmp_path / "out"), "--kind", "agent"])
+    r = runner.invoke(cov_cmd.app, ["coverage", str(agent), "--kind", "agent"])
     assert r.exit_code == 0, r.output
     assert "不存在" not in r.output  # 没因路径踩坑
+    assert (adir / "evals" / "coverage-report.json").exists()
+    assert (adir / "evals" / "coverage-report.html").exists()
+
+
+def test_coverage_skill_default_output_stays_in_evals(monkeypatch, tmp_path):
+    """Directory-based skill remains the positive control for the default report path."""
+    runner = CliRunner()
+    skill, edir = _coverage_skill(tmp_path, "---\nname: sk\ndescription: d\n---\n# S\n规则X\n")
+    (edir / "evals.json").write_text(
+        json.dumps({"skill_name": "sk", "evals": [{"id": 1, "prompt": "p"}]}), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        cov_cmd,
+        "analyze_coverage",
+        lambda skill_path, eval_set, *, model=None, timeout=120, kind=None: CoverageReport(
+            skill_name="sk", points=[]
+        ),
+    )
+
+    r = runner.invoke(cov_cmd.app, ["coverage", str(skill)])
+    assert r.exit_code == 0, r.output
+    assert (edir / "coverage-report.json").exists()
+    assert (edir / "coverage-report.html").exists()
 
 
 def test_coverage_augment_agent_routes_generate_for_agent(monkeypatch, tmp_path):

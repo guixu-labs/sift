@@ -6,10 +6,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from sift.models.audit_models import AuditReport
+from sift.reporting.embedded_data import dumps_for_script
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _PLACEHOLDER = "/*__EMBEDDED_DATA__*/"
@@ -22,7 +22,7 @@ class AuditReportGenerator:
     def generate_html(report: AuditReport) -> str:
         template = (_TEMPLATE_DIR / "audit-report.html").read_text(encoding="utf-8")
         data = report.model_dump(mode="json")
-        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        payload = dumps_for_script(data, indent=2)
         return template.replace(_PLACEHOLDER, f"const EMBEDDED_DATA = {payload};")
 
     def write_html(self, report: AuditReport, path: Path) -> Path:

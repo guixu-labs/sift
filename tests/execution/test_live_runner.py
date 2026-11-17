@@ -35,7 +35,9 @@ def _make_run_output() -> RunOutput:
 
 def _make_skill(skill_dir: Path) -> None:
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: t\ndescription: test\n---\n# body\n", encoding="utf-8")
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: t\ndescription: test\n---\n# body\n", encoding="utf-8"
+    )
 
 
 def test_live_task_copies_cwd_to_workspace(tmp_path: Path) -> None:
@@ -50,7 +52,9 @@ def test_live_task_copies_cwd_to_workspace(tmp_path: Path) -> None:
     with patch("sift.execution.live_runner.ClaudeRunner") as cr:
         cr.return_value.run.return_value = _make_run_output()
         run_live_task(
-            skill_path=skill, task="review target.py", options=LiveTaskOptions(cwd=cwd, runs=1, output_dir=out)
+            skill_path=skill,
+            task="review target.py",
+            options=LiveTaskOptions(cwd=cwd, runs=1, output_dir=out),
         )
 
     workspace = out / "workspace"
@@ -71,9 +75,13 @@ def test_live_task_copies_skill_references(tmp_path: Path) -> None:
 
     with patch("sift.execution.live_runner.ClaudeRunner") as cr:
         cr.return_value.run.return_value = _make_run_output()
-        run_live_task(skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=1, output_dir=out))
+        run_live_task(
+            skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=1, output_dir=out)
+        )
 
-    assert (out / "workspace" / "references" / "patterns.md").read_text(encoding="utf-8") == "patterns"
+    assert (out / "workspace" / "references" / "patterns.md").read_text(
+        encoding="utf-8"
+    ) == "patterns"
 
 
 def test_live_task_dumps_transcript_jsonl(tmp_path: Path) -> None:
@@ -86,7 +94,9 @@ def test_live_task_dumps_transcript_jsonl(tmp_path: Path) -> None:
 
     with patch("sift.execution.live_runner.ClaudeRunner") as cr:
         cr.return_value.run.return_value = _make_run_output()
-        run_live_task(skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=2, output_dir=out))
+        run_live_task(
+            skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=2, output_dir=out)
+        )
 
     for n in (1, 2):
         dumped = (out / f"run-{n}" / "transcript.jsonl").read_text(encoding="utf-8")
@@ -103,22 +113,96 @@ def test_live_task_runs_n_times(tmp_path: Path) -> None:
 
     with patch("sift.execution.live_runner.ClaudeRunner") as cr:
         cr.return_value.run.return_value = _make_run_output()
-        run_live_task(skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=3, output_dir=out))
+        run_live_task(
+            skill_path=skill, task="t", options=LiveTaskOptions(cwd=cwd, runs=3, output_dir=out)
+        )
 
     assert cr.return_value.run.call_count == 3
 
 
-def test_live_task_no_cwd_uses_skill_dir(tmp_path: Path) -> None:
-    """没给 --cwd:不拷贝,spawn cwd 用 skill 目录(无文件材料的纯任务仍可跑)。"""
+def test_live_task_resets_cwd_copy_before_each_run(tmp_path: Path) -> None:
+    """Each repeated run starts from the same --cwd snapshot, not the previous run's edits."""
     skill = tmp_path / "skill"
     _make_skill(skill)
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    source = cwd / "target.txt"
+    source.write_text("original", encoding="utf-8")
+    out = tmp_path / "out"
+    observations = []
+
+    class EditingRunner:
+        @staticmethod
+        def run(**kwargs):
+            workspace = kwargs["options"].cwd
+            observations.append(
+                (
+                    (workspace / "target.txt").read_text(encoding="utf-8"),
+                    (workspace / "run-only.txt").exists(),
+                )
+            )
+            (workspace / "target.txt").write_text("modified", encoding="utf-8")
+            (workspace / "run-only.txt").write_text("generated", encoding="utf-8")
+            source.write_text("changed during run", encoding="utf-8")
+            return _make_run_output()
+
+    with patch("sift.execution.live_runner.make_live_runner", return_value=EditingRunner()):
+        run_live_task(
+            skill_path=skill,
+            task="edit target.txt",
+            options=LiveTaskOptions(cwd=cwd, runs=2, output_dir=out),
+        )
+
+    assert observations == [("original", False), ("original", False)]
+    assert source.read_text(encoding="utf-8") == "changed during run"
+    assert not (cwd / "run-only.txt").exists()
+
+
+def test_live_task_rejects_workspace_overlapping_cwd(tmp_path: Path) -> None:
+    """Reject an output path that would make workspace cleanup delete the input tree."""
+    from sift.errors import InputError
+
+    skill = tmp_path / "skill"
+    _make_skill(skill)
+    cwd = tmp_path / "out" / "workspace"
+    cwd.mkdir(parents=True)
+    source = cwd / "target.txt"
+    source.write_text("original", encoding="utf-8")
+
+    with pytest.raises(InputError, match="must not overlap the run input"):
+        run_live_task(
+            skill_path=skill,
+            task="inspect",
+            options=LiveTaskOptions(cwd=cwd, output_dir=tmp_path / "out"),
+        )
+
+    assert source.read_text(encoding="utf-8") == "original"
+
+
+def test_live_task_no_cwd_isolates_skill_copy_per_run(tmp_path: Path) -> None:
+    """Without --cwd, every run gets a fresh copy and cannot mutate the source skill."""
+    skill = tmp_path / "skill"
+    _make_skill(skill)
+    observations = []
     out = tmp_path / "out"
 
-    with patch("sift.execution.live_runner.ClaudeRunner") as cr:
-        cr.return_value.run.return_value = _make_run_output()
-        run_live_task(skill_path=skill, task="t", options=LiveTaskOptions(cwd=None, runs=1, output_dir=out))
+    class EditingRunner:
+        @staticmethod
+        def run(**kwargs):
+            workspace = kwargs["options"].cwd
+            observations.append((workspace, (workspace / "created.txt").exists()))
+            (workspace / "created.txt").write_text("run output", encoding="utf-8")
+            return _make_run_output()
 
-    assert cr.return_value.run.call_args.kwargs["options"].cwd == skill
+    with patch("sift.execution.live_runner.make_live_runner", return_value=EditingRunner()):
+        run_live_task(
+            skill_path=skill, task="t", options=LiveTaskOptions(cwd=None, runs=2, output_dir=out)
+        )
+
+    assert [exists for _, exists in observations] == [False, False]
+    assert all(workspace == out / "workspace" for workspace, _ in observations)
+    assert not (skill / "created.txt").exists()
+    assert (skill / "SKILL.md").exists()
 
 
 def test_format_run_summary_renders_metrics_and_result_head():
@@ -191,10 +275,14 @@ def test_run_live_task_multi_executor_namespaced_dirs(tmp_path, monkeypatch):
     lr.run_live_task(
         skill_path=_skill_with_md(tmp_path),
         task="t",
-        options=LiveTaskOptions(cwd=_cwd_dir(tmp_path), runs=1, executors=["cc", "opencode"], output_dir=out),
+        options=LiveTaskOptions(
+            cwd=_cwd_dir(tmp_path), runs=1, executors=["cc", "opencode"], output_dir=out
+        ),
     )
     assert (out / "run-1-cc" / "transcript.jsonl").read_text(encoding="utf-8") == "cc-TRANSCRIPT"
-    assert (out / "run-1-opencode" / "transcript.json").read_text(encoding="utf-8") == "opencode-TRANSCRIPT"
+    assert (out / "run-1-opencode" / "transcript.json").read_text(
+        encoding="utf-8"
+    ) == "opencode-TRANSCRIPT"
 
 
 def test_run_live_task_single_executor_no_suffix_backward_compat(tmp_path, monkeypatch):
@@ -204,13 +292,17 @@ def test_run_live_task_single_executor_no_suffix_backward_compat(tmp_path, monke
     monkeypatch.setattr(
         lr,
         "make_live_runner",
-        lambda name: type("F", (), {"run": lambda self, **kw: RunOutput(exit_code=0, stdout="X")})(),
+        lambda name: type(
+            "F", (), {"run": lambda self, **kw: RunOutput(exit_code=0, stdout="X")}
+        )(),
     )
     out = tmp_path / "out"
     lr.run_live_task(
         skill_path=_skill_with_md(tmp_path),
         task="t",
-        options=LiveTaskOptions(cwd=_cwd_dir(tmp_path), runs=1, executors=["opencode"], output_dir=out),
+        options=LiveTaskOptions(
+            cwd=_cwd_dir(tmp_path), runs=1, executors=["opencode"], output_dir=out
+        ),
     )
     assert (out / "run-1" / "transcript.json").exists()
     assert not (out / "run-1-opencode").exists()

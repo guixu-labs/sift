@@ -1,5 +1,7 @@
 """gate 判决逻辑纯函数测试(块 C)。"""
 
+import pytest
+
 from sift.gating.verdict import evaluate_gate, parse_delta
 
 
@@ -97,6 +99,33 @@ def test_comparison_fail_below_threshold():
     assert r.axes["comparison"].verdict == "FAIL"
 
 
+def test_candidate_b_uses_its_subjective_win_rate():
+    r = evaluate_gate(
+        _bench("+0.27", _cs(2, 6)),
+        min_win_rate=0.5,
+        candidate="v2",
+        programmatic_guard=False,
+    )
+    assert r.decision == "PASS"
+    assert r.candidate == "v2" and r.baseline == "v1"
+    assert r.axes["comparison"].win_rate == 0.75
+
+
+@pytest.mark.parametrize(("delta", "verdict", "oriented"), [("+0.10", "FAIL", -0.1), ("-0.10", "PASS", 0.1)])
+def test_candidate_b_orients_programmatic_delta(delta, verdict, oriented):
+    r = evaluate_gate(_bench(delta), candidate="v2")
+    assert r.axes["programmatic"].verdict == verdict
+    assert r.axes["programmatic"].delta == oriented
+    assert r.axes["programmatic"].raw_delta == float(delta)
+
+
+def test_candidate_comparison_exposes_oriented_win_count():
+    r = evaluate_gate(_bench("+0.27", _cs(2, 8)), min_win_rate=0.5, candidate="v2")
+    assert r.axes["comparison"].candidate_wins == 8
+    assert r.axes["comparison"].a_wins == 2
+    assert r.axes["comparison"].b_wins == 8
+
+
 def test_comparison_unclear_insufficient_sample():
     r = evaluate_gate(_bench("+0.27", _cs(2, 0)), min_win_rate=0.5, min_valid=3)
     assert r.axes["comparison"].verdict == "N/A"  # decisive 2 < min_valid 3(轴级仍 N/A,applicable=True 信号不足)
@@ -142,9 +171,14 @@ def test_no_engaged_axis_is_na():
 
 
 def test_candidate_override():
-    r = evaluate_gate(_bench("+0.27", _cs(6, 2, label_a="v1", label_b="v2")), min_win_rate=0.5, candidate="custom-cand")
-    assert r.candidate == "custom-cand"
-    assert r.baseline == "v2"  # label_b 仍取 comparison_summary
+    r = evaluate_gate(_bench("+0.27", _cs(6, 2, label_a="v1", label_b="v2")), min_win_rate=0.5, candidate="v2")
+    assert r.candidate == "v2"
+    assert r.baseline == "v1"
+
+
+def test_candidate_must_match_benchmark_side():
+    with pytest.raises(ValueError, match="must match a benchmark side"):
+        evaluate_gate(_bench("+0.27", _cs(6, 2)), candidate="custom-cand")
 
 
 def test_candidate_resolution_from_side_keys():

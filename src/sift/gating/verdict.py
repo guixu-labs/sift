@@ -15,33 +15,55 @@ def parse_delta(value) -> float | None:
         return None
 
 
-def _resolve_sides(benchmark: dict, candidate: str | None) -> tuple[str, str]:
-    """候选/基线解析:--candidate > comparison_summary.label_a > 首个 side key。"""
+def _resolve_sides(benchmark: dict, candidate: str | None) -> tuple[str, str, bool]:
+    """解析候选/基线及候选方向;显式候选必须匹配 benchmark 中的一个 side。"""
     run_summary = benchmark.get("run_summary", {}) or {}
     side_keys = [k for k in run_summary if k != "delta"]
     cs = benchmark.get("comparison_summary") or {}
-    cand = candidate or cs.get("label_a") or (side_keys[0] if side_keys else "")
-    base = cs.get("label_b") or (side_keys[1] if len(side_keys) > 1 else "")
-    return cand, base
+    label_a = cs.get("label_a") or (side_keys[0] if side_keys else "")
+    label_b = cs.get("label_b") or (side_keys[1] if len(side_keys) > 1 else "")
+    if label_a and label_b and label_a == label_b:
+        raise ValueError(f"benchmark comparison sides have duplicate label {label_a!r}")
+    if candidate is None:
+        return label_a, label_b, False
+    if label_a and candidate == label_a:
+        return candidate, label_b, False
+    if label_b and candidate == label_b:
+        return candidate, label_a, True
+    available = ", ".join(repr(label) for label in (label_a, label_b) if label)
+    raise ValueError(f"--candidate {candidate!r} must match a benchmark side ({available or 'none found'})")
 
 
-def _eval_programmatic(benchmark: dict, guard_on: bool) -> AxisVerdict:
+def _eval_programmatic(benchmark: dict, guard_on: bool, candidate_is_b: bool) -> AxisVerdict:
     if not guard_on:
         return AxisVerdict(verdict="N/A", applicable=False, reason="客观守卫已关(--no-programmatic-guard)")
     raw = (benchmark.get("run_summary", {}) or {}).get("delta", {}).get("pass_rate_programmatic")
-    delta = parse_delta(raw)
-    if delta is None:
+    raw_delta = parse_delta(raw)
+    if raw_delta is None:
         return AxisVerdict(
             verdict="N/A",
             applicable=False,
             reason="delta.pass_rate_programmatic 无值(纯主观题 / 无 programmatic expectation)",
         )
+    delta = -raw_delta if candidate_is_b else raw_delta
     if delta < 0:
-        return AxisVerdict(verdict="FAIL", delta=delta, reason=f"客观侧回归({delta:+.2f})")
-    return AxisVerdict(verdict="PASS", delta=delta, reason=f"客观侧无回归({delta:+.2f})")
+        return AxisVerdict(
+            verdict="FAIL", delta=delta, raw_delta=raw_delta,
+            reason=f"candidate 侧客观回归({delta:+.2f})",
+        )
+    return AxisVerdict(
+        verdict="PASS", delta=delta, raw_delta=raw_delta,
+        reason=f"candidate 侧客观无回归({delta:+.2f})",
+    )
 
 
-def _eval_comparison(benchmark: dict, min_win_rate: float | None, min_valid: int, warnings: list[str]) -> AxisVerdict:
+def _eval_comparison(
+    benchmark: dict,
+    min_win_rate: float | None,
+    min_valid: int,
+    candidate_is_b: bool,
+    warnings: list[str],
+) -> AxisVerdict:
     if min_win_rate is None:
         return AxisVerdict(verdict="N/A", applicable=False, reason="主观 gate 未请求(未给 --min-win-rate)")
     cs = benchmark.get("comparison_summary")
@@ -52,10 +74,18 @@ def _eval_comparison(benchmark: dict, min_win_rate: float | None, min_valid: int
     b_wins = int(cs.get("b_wins") or 0)
     ties = int(cs.get("ties") or 0)
     decisive = a_wins + b_wins  # tie-排除:tie 不进胜率分母
-    common = dict(win_rate=None, decisive=decisive, a_wins=a_wins, b_wins=b_wins, ties=ties)
+    candidate_wins = b_wins if candidate_is_b else a_wins
+    common = {
+        "win_rate": None,
+        "decisive": decisive,
+        "a_wins": a_wins,
+        "b_wins": b_wins,
+        "candidate_wins": candidate_wins,
+        "ties": ties,
+    }
     if decisive == 0:
         return AxisVerdict(verdict="N/A", applicable=True, reason="无决定性比较(全 tie/failed)", **common)
-    wr = a_wins / decisive
+    wr = candidate_wins / decisive
     common["win_rate"] = wr
     if decisive < min_valid:
         return AxisVerdict(
@@ -171,9 +201,9 @@ def evaluate_gate(
     strict_drift: bool = False,
 ) -> GateResult:
     warnings: list[str] = []
-    cand, base = _resolve_sides(benchmark, candidate)
-    p = _eval_programmatic(benchmark, programmatic_guard)
-    c = _eval_comparison(benchmark, min_win_rate, min_valid, warnings)
+    cand, base, candidate_is_b = _resolve_sides(benchmark, candidate)
+    p = _eval_programmatic(benchmark, programmatic_guard, candidate_is_b)
+    c = _eval_comparison(benchmark, min_win_rate, min_valid, candidate_is_b, warnings)
     axes = {"programmatic": p, "comparison": c}
     axes["must_pass"] = _eval_must_pass(benchmark, cand, must_pass_ids or [], warnings)
     drift = _eval_drift(benchmark, baseline_ids, strict_drift, warnings)

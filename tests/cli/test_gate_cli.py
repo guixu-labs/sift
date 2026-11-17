@@ -25,6 +25,19 @@ def _write_bench(path, delta_prog="+0.27", cs=None, runs=None):
     return path
 
 
+def _comparison_summary():
+    return {
+        "a_wins": 2,
+        "b_wins": 6,
+        "ties": 0,
+        "failed": 0,
+        "valid": 8,
+        "win_rate": None,
+        "label_a": "v1",
+        "label_b": "v2",
+    }
+
+
 def test_gate_pass_exit0(tmp_path):
     bp = _write_bench(tmp_path / "benchmark.json", "+0.27")
     r = cli.invoke(app, ["gate", str(bp), "-o", str(tmp_path / "gate.json")])
@@ -50,21 +63,47 @@ def test_gate_na_exit2(tmp_path):
 
 
 def test_gate_comparison_threshold(tmp_path):
-    cs = {
-        "a_wins": 2,
-        "b_wins": 6,
-        "ties": 0,
-        "failed": 0,
-        "valid": 8,
-        "win_rate": None,
-        "label_a": "v1",
-        "label_b": "v2",
-    }
-    bp = _write_bench(tmp_path / "benchmark.json", "+0.27", cs)
+    bp = _write_bench(tmp_path / "benchmark.json", "+0.27", _comparison_summary())
     r = cli.invoke(app, ["gate", str(bp), "--min-win-rate", "0.5", "-o", str(tmp_path / "g.json")])
     assert r.exit_code == 1  # 主观 0.25 < 0.5 → FAIL
     g = json.loads((tmp_path / "g.json").read_text())
     assert g["axes"]["comparison"]["win_rate"] == 0.25
+
+
+def test_gate_candidate_b_comparison_threshold(tmp_path):
+    bp = _write_bench(
+        tmp_path / "benchmark.json", "+0.27", _comparison_summary()
+    )
+    r = cli.invoke(
+        app,
+        [
+            "gate",
+            str(bp),
+            "--candidate",
+            "v2",
+            "--no-programmatic-guard",
+            "--min-win-rate",
+            "0.5",
+            "-o",
+            str(tmp_path / "g.json"),
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    g = json.loads((tmp_path / "g.json").read_text())
+    assert g["candidate"] == "v2" and g["baseline"] == "v1"
+    comparison = g["axes"]["comparison"]
+    assert comparison["win_rate"] == 0.75
+    assert comparison["candidate_wins"] == 6
+    assert comparison["a_wins"] == 2 and comparison["b_wins"] == 6
+
+
+def test_gate_invalid_candidate_exit2_without_gate_json(tmp_path):
+    cs = {"label_a": "v1", "label_b": "v2", "a_wins": 1, "b_wins": 1, "ties": 0}
+    bp = _write_bench(tmp_path / "benchmark.json", "+0.27", cs)
+    r = cli.invoke(app, ["gate", str(bp), "--candidate", "custom", "-o", str(tmp_path / "g.json")])
+    assert r.exit_code == 2
+    assert "must match a benchmark side" in r.output
+    assert not (tmp_path / "g.json").exists()
 
 
 def test_gate_missing_file_exit2_no_gatejson(tmp_path):

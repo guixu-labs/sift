@@ -9,7 +9,7 @@ import typer
 
 from sift.cli.main import app, console
 from sift.cli.options import options_command
-from sift.errors import SiftError
+from sift.errors import InputError, SiftError
 from sift.evals.inspect import same_prompt_groups
 from sift.parser import resolve_skill_dir
 
@@ -19,7 +19,9 @@ _INIT_KIND_HELP = (
     "归属切)"
 )
 
-_INIT_TIMEOUT_HELP = "LLM 调用超时秒数(mining 是单次大 prompt,默认 600;撞超时 → degraded fallback)"
+_INIT_TIMEOUT_HELP = (
+    "LLM 调用超时秒数(mining 是单次大 prompt,默认 600;撞超时 → degraded fallback)"
+)
 
 _INIT_APPEND_HELP = "追加到已有 evals.json(不覆盖):新 eval 的 id 接续已有 max+1。常配 --focus 定向补薄弱面。"
 
@@ -29,22 +31,26 @@ _INIT_FOCUS_HELP = (
     "增量补到已有 evals.json。"
 )
 
-_INIT_TRIGGER_PROBES_HELP = (
-    "生成 trigger-accuracy 探题(should/should-not 各 N 道)追加到 evals.json 的 trigger_probes 段。"
-)
+_INIT_TRIGGER_PROBES_HELP = "生成 trigger-accuracy 探题(should/should-not 各 N 道)追加到 evals.json 的 trigger_probes 段。"
 
 
 _INIT_SKILL_PATH_ARGUMENT = typer.Argument(..., help="Path to skill directory")
 
-_INIT_OUTPUT_OPTION = typer.Option(None, "--output", "-o", help="Output directory for evals.json")
+_INIT_OUTPUT_OPTION = typer.Option(
+    None, "--output", "-o", help="Output directory for evals.json"
+)
 
 _INIT_GENERATE_PROMPTS_OPTION = typer.Option(
-    True, "--generate-prompts/--no-generate-prompts", help="Use LLM to generate L1 unit-level evals"
+    True,
+    "--generate-prompts/--no-generate-prompts",
+    help="Use LLM to generate L1 unit-level evals",
 )
 
 _INIT_MODEL_OPTION = typer.Option(None, "--model", help="Model for LLM generation")
 
-_INIT_NUM_EVALS_OPTION = typer.Option(None, "--num-evals", help="Max number of eval cases to generate")
+_INIT_NUM_EVALS_OPTION = typer.Option(
+    None, "--num-evals", help="Max number of eval cases to generate"
+)
 
 _INIT_FROM_TRANSCRIPT_OPTION = typer.Option(
     None,
@@ -124,63 +130,84 @@ def init(cli_options: InitCommandOptions):
 
     Generates L1 unit test cases from SKILL.md content.
     """
-    skill_path = cli_options.skill_path
-    output = cli_options.output
-    skill_path = resolve_skill_dir(skill_path)
-    from sift.evals.generator import EvalInitGenerator
-
     try:
-        gen = EvalInitGenerator(model=cli_options.model, timeout=cli_options.timeout, focus=cli_options.focus)
-
-        # 提前算 output 路径:append 模式要在生成前读已有 evals.json(喂定向补题 + 去重)
-        output = _resolve_evals_output(skill_path, output)
-
-        # append 模式:提前读现有 evals。生成阶段喂 _existing_evals(定向补题 + 语义去重,
-        # 治半聚焦/不去重);合并阶段复用 _existing_raw 保原题字节。读失败 → 降级覆盖写。
-        _existing_raw, _existing_evals = _load_existing_evals(cli_options.append, output)
-
-        # --kind 通验(声明类型:生成时选 skill/agent 出题路径;配 --from-transcript 选挖掘作用域)
-        if cli_options.kind is not None and cli_options.kind not in ("skill", "agent"):
-            console.print((f"[red]Error:[/red] --kind 只接受 skill / agent,收到 {cli_options.kind!r}"))
-            raise typer.Exit(code=2)
-
-        eval_set = _generate_init_evals(
-            gen,
-            skill_path,
-            _existing_evals,
-            _InitGenerationOptions(cli_options.from_transcript, cli_options.kind, cli_options.generate_prompts),
-        )
-
-        _trim_init_evals(eval_set, cli_options.num_evals, cli_options.append, output)
-
-        eval_set, appended, new_evals_display, _write_raw = _append_generated_evals(
-            cli_options.append, _existing_raw, eval_set
-        )
-
-        if cli_options.trigger_probes:
-            eval_set = _generate_init_probes(
-                gen,
-                eval_set,
-                _write_raw,
-                _InitProbeOptions(
-                    output, cli_options.append, skill_path, cli_options.num_evals, cli_options.from_transcript
-                ),
-            )
-
-        # append 模式写 _write_raw(原有字节保留 + 新追加);否则 model_dump 全量。
-        data = _write_raw if _write_raw is not None else eval_set.model_dump(mode="json")
-        output.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        _print_generated_evals(eval_set, gen, output, appended, new_evals_display)
+        _execute_init(cli_options)
     except SiftError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
 
 
+def _execute_init(cli_options):
+    from sift.evals.generator import EvalInitGenerator
+
+    skill_path = resolve_skill_dir(cli_options.skill_path)
+    gen = EvalInitGenerator(
+        model=cli_options.model,
+        timeout=cli_options.timeout,
+        focus=cli_options.focus,
+    )
+    output = _resolve_evals_output(skill_path, cli_options.output)
+    _existing_raw, _existing_evals = _load_existing_evals(cli_options.append, output)
+    _validate_init_kind(cli_options.kind)
+    eval_set, appended, new_evals_display, write_raw = _build_init_eval_set(
+        cli_options, gen, skill_path, output, _existing_raw, _existing_evals
+    )
+    _write_init_output(output, eval_set, write_raw)
+    _print_generated_evals(eval_set, gen, output, appended, new_evals_display)
+
+
+def _validate_init_kind(kind):
+    if kind is not None and kind not in ("skill", "agent"):
+        console.print(f"[red]Error:[/red] --kind 只接受 skill / agent,收到 {kind!r}")
+        raise typer.Exit(code=2)
+
+
+def _build_init_eval_set(
+    cli_options, gen, skill_path, output, existing_raw, existing_evals
+):
+    eval_set = _generate_init_evals(
+        gen,
+        skill_path,
+        existing_evals,
+        _InitGenerationOptions(
+            cli_options.from_transcript,
+            cli_options.kind,
+            cli_options.generate_prompts,
+        ),
+    )
+    _trim_init_evals(eval_set, cli_options.num_evals, cli_options.append, output)
+    eval_set, appended, new_evals_display, write_raw = _append_generated_evals(
+        cli_options.append, existing_raw, eval_set
+    )
+    if cli_options.trigger_probes:
+        eval_set = _generate_init_probes(
+            gen,
+            eval_set,
+            write_raw,
+            _InitProbeOptions(
+                output,
+                cli_options.append,
+                skill_path,
+                cli_options.num_evals,
+                cli_options.from_transcript,
+            ),
+        )
+    return eval_set, appended, new_evals_display, write_raw
+
+
+def _write_init_output(output, eval_set, write_raw):
+    data = write_raw if write_raw is not None else eval_set.model_dump(mode="json")
+    output.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _resolve_evals_output(skill_path, output):
-    """Resolve the eval file path while preserving the existing directory behavior."""
+    """Resolve the eval file path from the documented output directory option.
+
+    Existing file paths remain supported for callers that already pass an
+    explicit ``evals.json`` target. A new path without a JSON suffix is
+    treated as a directory, matching the CLI help and the behavior for an
+    already-created directory.
+    """
     if output is None:
         # skill_path 经 resolve_skill_dir:SKILL.md/目录 → 目录;agent .md → 文件(原样)。
         # .md 文件取 parent(agent 目录),让 agent 考卷默认写 <agent>/evals/(像 skill)。
@@ -189,6 +216,27 @@ def _resolve_evals_output(skill_path, output):
         evals_dir.mkdir(exist_ok=True)
         output = evals_dir / "evals.json"
     elif output.is_dir():
+        output = output / "evals.json"
+    elif output.suffix.lower() == ".json":
+        # Preserve the pre-existing explicit-file form. For a new JSON path,
+        # create its parent so the file target behaves like other CLI outputs.
+        if not output.exists():
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise InputError(
+                    f"--output 文件的父目录不可创建: {output.parent}"
+                ) from exc
+    elif output.exists():
+        raise InputError(f"--output 必须是目录或 evals.json 文件: {output}")
+    else:
+        # Typer gives us a Path without knowing whether a missing path is a
+        # file or directory. The public option is a directory, so materialize
+        # that directory before appending the canonical evals.json filename.
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise InputError(f"--output 目录不可创建: {output}") from exc
         output = output / "evals.json"
     return output
 
@@ -212,7 +260,9 @@ def _append_generated_evals(append, _existing_raw, eval_set):
     """Append new cases with continued IDs and preserve the original raw fields."""
     appended = 0
     new_evals_display: list = []  # append 模式:终端只列这些新增(B);非 append 为空 → 列全量
-    _write_raw = None  # append 模式:保留原有字节的 raw dict(A);非 append 为 None → model_dump 写
+    _write_raw = (
+        None  # append 模式:保留原有字节的 raw dict(A);非 append 为 None → model_dump 写
+    )
     if append and _existing_raw is not None:
         from sift.models import EvalSet
 
@@ -225,7 +275,9 @@ def _append_generated_evals(append, _existing_raw, eval_set):
         appended = len(new_evals)
         # A:原有 raw evals 字节保留,只追加新题 model_dump(不重序列化原有 →
         # diff 干净、不丢 EvalCase 不认的未知字段)。
-        _existing_raw.setdefault("evals", []).extend(e.model_dump(mode="json") for e in new_evals)
+        _existing_raw.setdefault("evals", []).extend(
+            e.model_dump(mode="json") for e in new_evals
+        )
         eval_set = existing
         eval_set.evals.extend(new_evals)
         _write_raw = _existing_raw
@@ -274,7 +326,9 @@ def _print_eval_diagnostics(display_evals, gen, eval_set):
         prompt_short = g["prompt"][:60] + ("…" if len(g["prompt"]) > 60 else "")
         flag_note = ",带 split flag" if g["split_flag"] else ""
         console.print(
-            (f"[cyan]ℹ[/cyan] 含同 prompt 题组:「{prompt_short}」× {g['count']} 道(不同 scenario{flag_note},非重复)")
+            (
+                f"[cyan]ℹ[/cyan] 含同 prompt 题组:「{prompt_short}」× {g['count']} 道(不同 scenario{flag_note},非重复)"
+            )
         )
 
 
@@ -300,18 +354,34 @@ def _append_trigger_probes(eval_set, generated_probes, mined_probes, _write_raw)
         next_id += 1
     eval_set.trigger_probes = existing_probes + new_probes
     if _write_raw is not None:  # append 模式:新 probe 也追加到 raw(保留原有 probe 字节)
-        _write_raw.setdefault("trigger_probes", []).extend(p.model_dump(mode="json") for p in new_probes)
+        _write_raw.setdefault("trigger_probes", []).extend(
+            p.model_dump(mode="json") for p in new_probes
+        )
     return new_probes, mined_kept
 
 
 def _print_trigger_probe_summary(new_probes, mined_kept, skill_path):
     """Report generated and mined probes, including unverified and leakage warnings."""
     if new_probes:
-        console.print((f"[green]Generated[/green] {len(new_probes) - len(mined_kept)} trigger probes"))
+        console.print(
+            (
+                f"[green]Generated[/green] {len(new_probes) - len(mined_kept)} trigger probes"
+            )
+        )
         if mined_kept:
-            n_unverified = sum(1 for p in mined_kept if p.rationale.startswith("[unverified"))
-            note = (f",{n_unverified} 条 unverified(LLM 过滤失败,建议人审)") if n_unverified else ""
-            console.print((f"[green]Mined[/green] {len(mined_kept)} 条 trace 负例(真实会话领域相邻未触发{note})"))
+            n_unverified = sum(
+                1 for p in mined_kept if p.rationale.startswith("[unverified")
+            )
+            note = (
+                (f",{n_unverified} 条 unverified(LLM 过滤失败,建议人审)")
+                if n_unverified
+                else ""
+            )
+            console.print(
+                (
+                    f"[green]Mined[/green] {len(mined_kept)} 条 trace 负例(真实会话领域相邻未触发{note})"
+                )
+            )
         # anti-leakage:should-trigger 探题若照抄 description 措辞,cc 可能靠字面匹配
         # 触发而非语义理解 → recall 虚高。只反馈(词面命中探题仍有诊断价值),不 retry。
         from sift.execution.trigger_runner import (
@@ -323,7 +393,11 @@ def _print_trigger_probe_summary(new_probes, mined_kept, skill_path):
         _desc = parse_skill_md(skill_path)[1]
         if _desc:
             n_generated_st = sum(1 for p in new_probes if p.expect_trigger)
-            leaks = [p for p in new_probes if p.expect_trigger and classify_phrase(p.prompt, _desc) == "literal"]
+            leaks = [
+                p
+                for p in new_probes
+                if p.expect_trigger and classify_phrase(p.prompt, _desc) == "literal"
+            ]
             if leaks:
                 console.print(
                     (
@@ -346,13 +420,17 @@ def _degraded_cases(evals):
     return degraded
 
 
-def _generate_init_evals(gen, skill_path: Path, _existing_evals, options: _InitGenerationOptions):
+def _generate_init_evals(
+    gen, skill_path: Path, _existing_evals, options: _InitGenerationOptions
+):
     """按 transcript、LLM 或模板路径生成考题。"""
     from_transcript, kind, generate_prompts = options
     if from_transcript:
         if not kind:
             _warn_transcript_generation_scope(from_transcript)
-        console.print((f"Mining evals from transcript [bold]{from_transcript}[/bold]..."))
+        console.print(
+            (f"Mining evals from transcript [bold]{from_transcript}[/bold]...")
+        )
         eval_set = gen.generate_from_transcript(
             skill_path,
             from_transcript,
@@ -363,11 +441,15 @@ def _generate_init_evals(gen, skill_path: Path, _existing_evals, options: _InitG
         with console.status("正在用 LLM 生成 evals…", spinner="dots"):
             if kind == "agent":
                 eval_set = gen.generate_for_agent(
-                    skill_path, existing_evals=_existing_evals, on_heartbeat=lambda m: console.print(m)
+                    skill_path,
+                    existing_evals=_existing_evals,
+                    on_heartbeat=lambda m: console.print(m),
                 )
             else:
                 eval_set = gen.generate_with_llm(
-                    skill_path, existing_evals=_existing_evals, on_heartbeat=lambda m: console.print(m)
+                    skill_path,
+                    existing_evals=_existing_evals,
+                    on_heartbeat=lambda m: console.print(m),
                 )
     else:
         console.print("Generating template evals...")
@@ -376,7 +458,9 @@ def _generate_init_evals(gen, skill_path: Path, _existing_evals, options: _InitG
     return eval_set
 
 
-def _trim_init_evals(eval_set, num_evals: int | None, append: bool, output: Path) -> None:
+def _trim_init_evals(
+    eval_set, num_evals: int | None, append: bool, output: Path
+) -> None:
     """限制题数，并防止空生成结果覆盖已有考卷。"""
     if num_evals and num_evals < len(eval_set.evals):
         console.print((f"  Trimming to {num_evals} evals (from {len(eval_set.evals)})"))
@@ -402,16 +486,26 @@ def _generate_init_probes(gen, eval_set, _write_raw, options: _InitProbeOptions)
         from sift.models import EvalSet
 
         try:
-            eval_set = EvalSet.model_validate(json.loads(output.read_text(encoding="utf-8")))
+            eval_set = EvalSet.model_validate(
+                json.loads(output.read_text(encoding="utf-8"))
+            )
         except Exception:
-            console.print((f"[yellow]⚠️ 读已有 {output} 失败,trigger 探题将附加到新生成的 evals。[/yellow]"))
+            console.print(
+                (
+                    f"[yellow]⚠️ 读已有 {output} 失败,trigger 探题将附加到新生成的 evals。[/yellow]"
+                )
+            )
     with console.status("正在生成 trigger 探题…", spinner="dots"):
-        generated_probes = gen.generate_trigger_probes(skill_path, num_each=(num_evals or 5))
+        generated_probes = gen.generate_trigger_probes(
+            skill_path, num_each=(num_evals or 5)
+        )
     # trace-mined 负例:配 --from-transcript 才挖(真实会话里领域相邻且未触发本
     # skill 的用户 query → should-not 真题;单给 --trigger-probes 维持纯生成)。
     mined_probes = []
     if from_transcript:
-        with console.status(f"正在从 {from_transcript} 挖 trigger 负例…", spinner="dots"):
+        with console.status(
+            f"正在从 {from_transcript} 挖 trigger 负例…", spinner="dots"
+        ):
             mined_probes = gen.mine_trigger_probes(skill_path, from_transcript)
     if num_evals:  # 每方向上限 trim(不补下限);只 trim 生成的——真题不受生成上限约束
         per = max(1, num_evals)
@@ -420,12 +514,16 @@ def _generate_init_probes(gen, eval_set, _write_raw, options: _InitProbeOptions)
         generated_probes = should + should_not
     # 归一去重(prompt lower+strip 精确匹配):挖的 vs 已有 + 生成的;挖的内部
     # 事实层已去重。语义去重不做——量小人审兜底。
-    new_probes, mined_kept = _append_trigger_probes(eval_set, generated_probes, mined_probes, _write_raw)
+    new_probes, mined_kept = _append_trigger_probes(
+        eval_set, generated_probes, mined_probes, _write_raw
+    )
     _print_trigger_probe_summary(new_probes, mined_kept, skill_path)
     return eval_set
 
 
-def _print_generated_evals(eval_set, gen, output: Path, appended: int, new_evals_display: list) -> None:
+def _print_generated_evals(
+    eval_set, gen, output: Path, appended: int, new_evals_display: list
+) -> None:
     """分别显示新增题数、合并总数、模型消耗和考题诊断。"""
     # B:append 模式终端只列新增(degraded / per-eval);非 append 列全量。
     display_evals = new_evals_display if new_evals_display else eval_set.evals
@@ -445,13 +543,19 @@ def _print_generated_evals(eval_set, gen, output: Path, appended: int, new_evals
         )
     else:
         console.print(
-            (f"Generated [green]{len(eval_set.evals)}[/green] eval cases for [bold]{eval_set.skill_name}[/bold]")
+            (
+                f"Generated [green]{len(eval_set.evals)}[/green] eval cases for [bold]{eval_set.skill_name}[/bold]"
+            )
         )
     tok = gen.llm_usage.get("input_tokens", 0) + gen.llm_usage.get("output_tokens", 0)
     if gen.llm_duration > 0 or tok:
         console.print((f"耗时 [bold]{gen.llm_duration:.1f}s[/bold] · {tok} tok"))
     if appended:
-        console.print((f"[green]Appended[/green] {appended} new evals to existing {output}(id 接续、原题保留)"))
+        console.print(
+            (
+                f"[green]Appended[/green] {appended} new evals to existing {output}(id 接续、原题保留)"
+            )
+        )
     _print_eval_diagnostics(display_evals, gen, eval_set)
     console.print(f"Written to {output}")
 
@@ -465,7 +569,7 @@ def _warn_transcript_generation_scope(from_transcript: Path) -> None:
         console.print(
             (
                 f"[yellow]⚠️  transcript 涉及 {len(skills)} 个 skill"
-                f"({', '.join(skills)}),会把全部当本 skill 挖、可能混入其他任务内容;"
+                f"({', '.join(skills)}),会把全部当本 skill 挖、可能串味;"
                 f"加 --kind skill 只挖本 skill 被调用期间段。[/yellow]"
             )
         )
@@ -474,7 +578,7 @@ def _warn_transcript_generation_scope(from_transcript: Path) -> None:
         console.print(
             (
                 f"[yellow]⚠️  transcript 涉及 {len(agents)} 个 agent"
-                f"({', '.join(agents)}),会把全部当本声明挖、可能混入其他任务内容;"
+                f"({', '.join(agents)}),会把全部当本声明挖、可能串味;"
                 f"加 --kind agent 只挖本 agent 被 dispatch 期间段。[/yellow]"
             )
         )
