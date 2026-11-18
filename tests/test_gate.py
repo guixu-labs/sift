@@ -142,9 +142,9 @@ def test_no_engaged_axis_is_na():
 
 
 def test_candidate_override():
-    r = evaluate_gate(_bench("+0.27", _cs(6, 2, label_a="v1", label_b="v2")), min_win_rate=0.5, candidate="custom-cand")
-    assert r.candidate == "custom-cand"
-    assert r.baseline == "v2"  # label_b 仍取 comparison_summary
+    r = evaluate_gate(_bench("+0.27", _cs(6, 2, label_a="v1", label_b="v2")), min_win_rate=0.5, candidate="v2")
+    assert r.candidate == "v2"
+    assert r.baseline == "v1"  # The baseline is the opposite side.
 
 
 def test_candidate_resolution_from_side_keys():

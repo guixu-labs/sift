@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .models import AxisVerdict, GateResult
 
 
@@ -10,44 +12,94 @@ def parse_delta(value) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if not isinstance(value, bool) and math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
 
-def _resolve_sides(benchmark: dict, candidate: str | None) -> tuple[str, str]:
-    """候选/基线解析:--candidate > comparison_summary.label_a > 首个 side key。"""
-    run_summary = benchmark.get("run_summary", {}) or {}
-    side_keys = [k for k in run_summary if k != "delta"]
+def _configuration(benchmark: dict, side: str) -> str:
+    summary = benchmark.get("run_summary") or {}
+    if side in summary and side != "delta":
+        return side
+    # These are SIFT's own default labels/configuration IDs (build_sides).
+    aliases = {"with": "with_skill", "without": "without_skill"}
+    if aliases.get(side) in summary:
+        return aliases[side]
     cs = benchmark.get("comparison_summary") or {}
-    cand = candidate or cs.get("label_a") or (side_keys[0] if side_keys else "")
-    base = cs.get("label_b") or (side_keys[1] if len(side_keys) > 1 else "")
+    if not [key for key in summary if key != "delta"] and side in [cs.get("label_a"), cs.get("label_b")]:
+        return side
+    raise ValueError(f"Unknown candidate/baseline side: {side!r}")
+
+
+def _resolve_sides(benchmark: dict, candidate: str | None) -> tuple[str, str]:
+    keys = [key for key in (benchmark.get("run_summary") or {}) if key != "delta"]
+    cs = benchmark.get("comparison_summary") or {}
+    labels = [cs.get("label_a"), cs.get("label_b")]
+    labels = labels if all(labels) else keys[:2]
+    cand = candidate or (labels[0] if labels else "")
+    if not cand:
+        return "", ""
+    canonical = _configuration(benchmark, cand)
+    matching = [label for label in labels if _configuration(benchmark, label) == canonical]
+    if labels and not matching:
+        raise ValueError(f"Unknown candidate side: {candidate!r}")
+    other = next((label for label in labels if _configuration(benchmark, label) != canonical), "")
+    base = _configuration(benchmark, other) if other and cand in keys else other
     return cand, base
 
 
-def _eval_programmatic(benchmark: dict, guard_on: bool) -> AxisVerdict:
+def _candidate_is_second(benchmark: dict, candidate: str | None) -> bool:
+    cs = benchmark.get("comparison_summary") or {}
+    if not candidate or not cs.get("label_b"):
+        return False
+    return _configuration(benchmark, candidate) == _configuration(benchmark, cs["label_b"])
+
+
+def _eval_programmatic(benchmark: dict, guard_on: bool, candidate: str | None = None) -> AxisVerdict:
     if not guard_on:
         return AxisVerdict(verdict="N/A", applicable=False, reason="客观守卫已关(--no-programmatic-guard)")
-    raw = (benchmark.get("run_summary", {}) or {}).get("delta", {}).get("pass_rate_programmatic")
-    delta = parse_delta(raw)
+    summary = benchmark.get("run_summary") or {}
+    cand, base = _resolve_sides(benchmark, candidate)
+    candidate_key = _configuration(benchmark, cand) if cand else ""
+    baseline_key = _configuration(benchmark, base) if base else ""
+    def mean_for(key):
+        raw = ((summary.get(key) or {}).get("pass_rate_programmatic") or {}).get("mean")
+        value = parse_delta(raw)
+        if raw is not None and value is None:
+            raise ValueError(f"Invalid programmatic mean for {key!r}")
+        return value
+    candidate_mean = mean_for(candidate_key)
+    baseline_mean = mean_for(baseline_key)
+    if candidate_mean is not None and baseline_mean is not None:
+        delta = candidate_mean - baseline_mean
+    else:
+        # Legacy summaries may contain only delta. Its direction follows the
+        # run_summary dictionary order, NOT randomized comparison labels.
+        delta = parse_delta((summary.get("delta") or {}).get("pass_rate_programmatic"))
+        keys = [key for key in summary if key != "delta"]
+        if delta is not None and (candidate_key not in keys[:2] or baseline_key not in keys[:2] or candidate_key == baseline_key):
+            return AxisVerdict(verdict="N/A", applicable=True, reason="Cannot bind programmatic delta to candidate and baseline")
+        if delta is not None and len(keys) > 1 and candidate_key == keys[1]:
+            delta = -delta
     if delta is None:
-        return AxisVerdict(
-            verdict="N/A",
-            applicable=False,
-            reason="delta.pass_rate_programmatic 无值(纯主观题 / 无 programmatic expectation)",
-        )
+        return AxisVerdict(verdict="N/A", applicable=False, reason="No programmatic comparison evidence")
+    if delta == 0:
+        delta = 0.0
     if delta < 0:
         return AxisVerdict(verdict="FAIL", delta=delta, reason=f"客观侧回归({delta:+.2f})")
     return AxisVerdict(verdict="PASS", delta=delta, reason=f"客观侧无回归({delta:+.2f})")
 
 
-def _eval_comparison(benchmark: dict, min_win_rate: float | None, min_valid: int, warnings: list[str]) -> AxisVerdict:
+def _eval_comparison(benchmark: dict, min_win_rate: float | None, min_valid: int, warnings: list[str], candidate: str | None = None) -> AxisVerdict:
     if min_win_rate is None:
         return AxisVerdict(verdict="N/A", applicable=False, reason="主观 gate 未请求(未给 --min-win-rate)")
     cs = benchmark.get("comparison_summary")
     if not cs:
         warnings.append("主观 gate 已请求但 comparison_summary 缺失(纯客观题 / 旧数据 / 比较失败)——落回客观侧")
         return AxisVerdict(verdict="N/A", applicable=False, reason="主观 gate 已请求但 comparison_summary 缺失")
+    if not cs.get("label_a") or not cs.get("label_b"):
+        return AxisVerdict(verdict="N/A", applicable=True, reason="Comparison side labels are missing; candidate win rate is unknown")
     a_wins = int(cs.get("a_wins") or 0)
     b_wins = int(cs.get("b_wins") or 0)
     ties = int(cs.get("ties") or 0)
@@ -55,7 +107,8 @@ def _eval_comparison(benchmark: dict, min_win_rate: float | None, min_valid: int
     common = dict(win_rate=None, decisive=decisive, a_wins=a_wins, b_wins=b_wins, ties=ties)
     if decisive == 0:
         return AxisVerdict(verdict="N/A", applicable=True, reason="无决定性比较(全 tie/failed)", **common)
-    wr = a_wins / decisive
+    candidate_wins = b_wins if _candidate_is_second(benchmark, candidate) else a_wins
+    wr = candidate_wins / decisive
     common["win_rate"] = wr
     if decisive < min_valid:
         return AxisVerdict(
@@ -80,8 +133,13 @@ def _eval_calibration(benchmark: dict, candidate: str, warnings: list[str]) -> d
     if not cs or not cs.get("sides"):
         return None
     out: dict[str, dict] = {}
-    # candidate 侧排前(顺序)
-    side_items = sorted(cs["sides"].items(), key=lambda kv: 0 if kv[0] == candidate else 1)
+    def is_candidate(side):
+        try:
+            return _configuration(benchmark, side) == _configuration(benchmark, candidate)
+        except ValueError:
+            return side == candidate
+    # Calibration keys may be comparison labels, while runs use configuration IDs.
+    side_items = sorted(cs["sides"].items(), key=lambda kv: 0 if is_candidate(kv[0]) else 1)
     for side, per in side_items:
         if not per:
             out[side] = {"triggered": False, "count": 0, "total": 0, "evidence": []}
@@ -91,7 +149,7 @@ def _eval_calibration(benchmark: dict, candidate: str, warnings: list[str]) -> d
         out[side] = {"triggered": triggered, "count": len(suspects), "total": per.get("total", 0), "evidence": suspects}
         if not (triggered):
             continue
-        tag = f"[candidate {side}]" if side == candidate else f"[{side}]"
+        tag = f"[candidate {side}]" if is_candidate(side) else f"[{side}]"
         warnings.append(
             f"⚠️ {tag} 高分低遵循 {len(suspects)} 个 HIGH_SCORE_SUSPECT"
             f"(结果对但过程硬违规,evidence 见 calibration.sides.{side}.evidence)"
@@ -114,7 +172,7 @@ def _eval_must_pass(benchmark: dict, candidate: str, ids: list[int], warnings: l
     runs = benchmark.get("runs") or []
     by_eval: dict[int, list[dict]] = {}
     for r in runs:
-        if not (r.get("configuration") == candidate):
+        if not (r.get("configuration") == _configuration(benchmark, candidate)):
             continue
         by_eval.setdefault(r.get("eval_id"), []).append(r)
     failed: list[int] = []
@@ -172,8 +230,8 @@ def evaluate_gate(
 ) -> GateResult:
     warnings: list[str] = []
     cand, base = _resolve_sides(benchmark, candidate)
-    p = _eval_programmatic(benchmark, programmatic_guard)
-    c = _eval_comparison(benchmark, min_win_rate, min_valid, warnings)
+    p = _eval_programmatic(benchmark, programmatic_guard, cand)
+    c = _eval_comparison(benchmark, min_win_rate, min_valid, warnings, cand)
     axes = {"programmatic": p, "comparison": c}
     axes["must_pass"] = _eval_must_pass(benchmark, cand, must_pass_ids or [], warnings)
     drift = _eval_drift(benchmark, baseline_ids, strict_drift, warnings)
