@@ -71,7 +71,7 @@ sift vet path/to/skill/ --skip-external # 跳过外部扫描器
 
 ### `init` — 初始化评测定义
 
-根据 SKILL.md 内容自动生成 `evals.json`。三种生成路径，优先级 `--from-transcript` > `--generate-prompts`（LLM）> 模板。`--kind agent` 改为给 **agent 定义.md** 出题（读 description + system prompt 凭角色造 role-matching 考题，不切段、不假设产文件，断言由 LLM 直接写）——agent 的「没有 transcript 时的出题路」；有真实 dispatch session 时 `--from-transcript --kind agent` 保真度更高（挖真实派发场景）。
+根据 SKILL.md 内容自动生成 `evals.json`。三种生成路径，优先级 `--from-run` 或 `--from-transcript`（两者互斥）> `--generate-prompts`（LLM）> 模板。`--kind agent` 改为给 **agent 定义.md** 出题（读 description + system prompt 凭角色造 role-matching 考题，不切段、不假设产文件，断言由 LLM 直接写）——agent 的「没有 transcript 时的出题路」；有真实 dispatch session 时，`--from-transcript --kind agent` 可从单个会话挖评分题，`--from-run --kind agent` 可从 run 中命中的会话挖评分题。
 
 > 生成的 `evals.json` 格式（字段 / AssertionType 全表 / expectations vs assertions / tier 坑）详见 [evals-format.md](evals-format.md)。
 
@@ -79,8 +79,14 @@ sift vet path/to/skill/ --skip-external # 跳过外部扫描器
 sift init path/to/skill/                                  # LLM 生成(默认)
 sift init path/to/skill/ --num-evals 8                    # 限制数量
 sift init path/to/skill/ --from-transcript session.jsonl  # 从真实会话挖 eval
+sift init path/to/skill/ --from-run path/to/run-bundle  # 从 run 中命中的完整 session 挖 eval
+sift init path/to/skill/ --from-run path/to/run-bundle --kind skill  # 只挖目标 skill 的执行部分
 sift init path/to/agent.md --kind agent                   # 给 agent 出题(读 agent 定义凭角色造 role-matching 题)
+sift init path/to/agent.md --from-transcript session.jsonl --kind agent  # 从 agent 执行挖评分题
+sift init path/to/agent.md --from-run path/to/run-bundle --kind agent  # 从 run 中的 agent 执行挖评分题
 ```
+
+上面两个带 `--kind agent` 的历史记录命令生成的是**评分题**。`--trigger-probes` 测的是 skill 是否被调用；目前不能用它判断 agent 是否被派发。
 
 **参数**：
 
@@ -91,6 +97,7 @@ sift init path/to/agent.md --kind agent                   # 给 agent 出题(读
 | `--model` | 默认 | LLM 模型 |
 | `--num-evals` | 无 | 最多生成的 eval case 数量 |
 | `--from-transcript` | 无 | 从真实 session transcript 挖 evals（加料 SKILL.md，非替代） |
+| `--from-run` | 无 | 从 run 包中有目标调用的 session 挖题，合并到一份 `evals.json`；省略 `--kind` 时使用命中 session 的完整记录，不能与 `--from-transcript` 同用。 |
 | `--kind` | (无) | 声明类型：生成时 `agent` = 按 agent 角色出题（读 agent 定义.md 凭 description/system prompt 造 role-matching 题，断言由 LLM 直接写）；默认/`skill` 走 skill 出题。配 `--from-transcript` 则选挖掘作用域（`skill`=按 Skill 调用切 / `agent`=按 agent 归属切，同 audit --kind；不传 + 多 skill/agent → 警告） |
 | `--timeout` | 600 | LLM 调用超时秒数（mining 是单次大 prompt；撞超时 → degraded fallback） |
 | `--focus` | (无) | 定向生成某一类 eval 补盲区：`negative-cases`（反面场景）/ `edge-cases`（边界/错误）/ 任意自由文本（声明特定方向）；常配 `--append`。`anti-triggers` 是旧名，保留为静默别名 |
@@ -98,6 +105,12 @@ sift init path/to/agent.md --kind agent                   # 给 agent 出题(读
 | `--trigger-probes` | 关 | 生成 trigger-accuracy 探题（should-trigger / should-not-trigger），追加到 evals.json 的 `trigger_probes` 段（见 [evals-format.md](evals-format.md)）。LLM 读 description 出题；默认每方向 5 道，`--num-evals` = 每方向**上限**（trim 多余、不补下限；只 trim 生成的，挖出的真题不受限）。**配 `--from-transcript` 时附带挖 trace 负例**：真实会话里「领域相邻且未触发本 skill」的用户 query 收为 should-not 真题（事实层程序判定 + LLM 只按 description 过滤领域相邻；LLM 失败仍收、标 `unverified` 人审）。不重生成已有 scoring evals（载入已有 evals.json 保留原题）；新探题 id 接续已有 trigger_probes `max+1`，与既有探题按 prompt（lower+strip）去重。配合 [`trigger`](#trigger--触发准确度第-4-维) 跑 |
 
 `--from-transcript` 解析 session transcript（模型、user turns、用到的 skill），重建 input_files / commands / produced_files，生成带结构化 assertions 的 eval。若 LLM 失败降级为 fallback eval，会带 `degraded:*` flag 并在终端告警（不再静默）。多声明单元 transcript（多个 skill、或主 agent dispatch 了子 agent）不传 `--kind` 时会把全部当本声明挖（可能混进别的单元）→ 终端告警，建议加对应 `--kind skill` / `--kind agent` 只挖本声明段。默认 LLM 生成路径**先重试再降级**（对齐 audit 判官）：调用失败（超时/限流/CLI 错）或响应解析失败（畸形/截断）都大概率瞬态，重试最多 2 次（终端打 `重试 n/2…`），耗尽才退确定性模板出题——每题带 `degraded:llm-fallback(原因;重试 N 次后仍失败)` flag + 终端 ⚠ 块提示重跑，token 已花但考卷非 LLM 出的，一眼可辨。`--kind agent` 同样先重试（1+2 次）；耗尽返回 0 题 + 终端告警，且**不覆盖已有 evals.json**（exit 1，既有考卷字节不动——agent 无确定性 fallback，空集覆盖会把旧题毁在瞬时故障手里）。
+
+**从 run 挖题**：先找出调用了同名 skill 或派发了同名 agent 的 session。省略 `--kind` 时，每个命中 session 的完整记录各是一份挖题材料；指定 `--kind skill` 或 `--kind agent` 时，只取相应的执行部分。例如 session A 调用了目标 skill 两次，session B 调用了一次：模型分别从 A、B 挖题，汇总后将题目 `prompt` 去掉首尾空白仍完全相同、且没有明确冲突的题合成一题，再写入同一个 `evals.json`。意思相近但措辞不同的题仍会分别保留；调用三次也不表示一定生成三道题。指定 `--kind skill` 时，模型还会看到每次调用前同一 session 中最近的用户请求；指定 `--kind agent` 时，模型还会看到派发给该 agent 的任务描述。
+
+**触发探题**：给 `--from-run --kind skill` 再加 `--trigger-probes`，会检查 run 中所有有效 session 的用户请求，包括没有调用目标 skill 的 session，找出记录中“目标 skill 未被调用”的请求作为负例候选。未调用只说明这次执行没有触发，不能单凭它认定 skill 本来就不该触发；生成的探题仍需人工核对。run 的触发探题必须明确指定 `--kind skill`。
+
+**输入格式**：`--from-transcript` 接收一份 Claude Code 风格的 JSONL 会话文件；`--from-run` 接收 run 包目录。Sift 会自动处理 run 包里的会话文件，无需手动转换。
 
 **字段名校验**：LLM 生成时若把字段名拼错（如 `expected_output`→`expected`、`assertions`→`assertion`），pydantic 默认会**静默丢弃**该字段——evals.json 看着生成成功、实则缺字段，`eval` 时才暴雷。`init` 会在终端告警 `⚠️ N 条 eval 含未知字段(已忽略;可能拼错)`，逐条列出哪个 eval 的哪些字段可疑，免得考卷悄悄残缺。warn 不拒（拒绝会掉确定性模板 fallback，反而更差）。
 

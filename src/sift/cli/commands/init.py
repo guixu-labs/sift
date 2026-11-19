@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -11,12 +12,13 @@ from sift.cli.main import app, console
 from sift.cli.options import options_command
 from sift.errors import SiftError
 from sift.evals.inspect import same_prompt_groups
-from sift.parser import resolve_skill_dir
+from sift.evals.run_bundle_mining import RunBundleMiningInputs, prepare_run_bundle_mining_inputs
+from sift.parser import parse_skill_md, resolve_skill_dir
 
 _INIT_KIND_HELP = (
     "声明类型:生成时 agent=按 agent 角色出题(默认/skill 走 skill 出题);配 "
     "--from-transcript 选挖掘作用域(skill=按 Skill 调用切 / agent=按 agent "
-    "归属切)"
+    "归属切);配 --from-run 时省略则挖命中 session 的完整记录"
 )
 
 _INIT_TIMEOUT_HELP = "LLM 调用超时秒数(mining 是单次大 prompt,默认 600;撞超时 → degraded fallback)"
@@ -50,6 +52,12 @@ _INIT_FROM_TRANSCRIPT_OPTION = typer.Option(
     None,
     "--from-transcript",
     help=("从真实 session transcript 挖 evals(加料 SKILL.md,非替代)"),
+)
+
+_INIT_FROM_RUN_OPTION = typer.Option(
+    None,
+    "--from-run",
+    help="从导出的 run 包中选择目标 skill/agent 的执行，逐 session 挖 evals；与 --from-transcript 互斥",
 )
 
 _INIT_KIND_OPTION = typer.Option(
@@ -89,6 +97,7 @@ class _InitGenerationOptions(NamedTuple):
     from_transcript: Path | None
     kind: str | None
     generate_prompts: bool
+    run_inputs: RunBundleMiningInputs | None
 
 
 class _InitProbeOptions(NamedTuple):
@@ -99,6 +108,7 @@ class _InitProbeOptions(NamedTuple):
     skill_path: Path
     num_evals: int | None
     from_transcript: Path | None
+    run_inputs: RunBundleMiningInputs | None
 
 
 @dataclass
@@ -111,6 +121,7 @@ class InitCommandOptions:
     model: Optional[str] = _INIT_MODEL_OPTION
     num_evals: Optional[int] = _INIT_NUM_EVALS_OPTION
     from_transcript: Optional[Path] = _INIT_FROM_TRANSCRIPT_OPTION
+    from_run: Optional[Path] = _INIT_FROM_RUN_OPTION
     kind: Optional[str] = _INIT_KIND_OPTION
     timeout: int = _INIT_TIMEOUT_OPTION
     append: bool = _INIT_APPEND_OPTION
@@ -129,7 +140,14 @@ def init(cli_options: InitCommandOptions):
     skill_path = resolve_skill_dir(skill_path)
     from sift.evals.generator import EvalInitGenerator
 
+    temporary_run: tempfile.TemporaryDirectory | None = None
     try:
+        if cli_options.from_run is not None and cli_options.from_transcript is not None:
+            console.print("[red]Error:[/red] --from-run 与 --from-transcript 互斥")
+            raise typer.Exit(code=2)
+        if cli_options.from_run is not None and cli_options.trigger_probes and cli_options.kind != "skill":
+            console.print("[red]Error:[/red] run 的 trigger 探题需要 --kind skill")
+            raise typer.Exit(code=2)
         gen = EvalInitGenerator(model=cli_options.model, timeout=cli_options.timeout, focus=cli_options.focus)
 
         # 提前算 output 路径:append 模式要在生成前读已有 evals.json(喂定向补题 + 去重)
@@ -144,11 +162,29 @@ def init(cli_options: InitCommandOptions):
             console.print((f"[red]Error:[/red] --kind 只接受 skill / agent,收到 {cli_options.kind!r}"))
             raise typer.Exit(code=2)
 
+        run_inputs = None
+        if cli_options.from_run is not None:
+            temporary_run = tempfile.TemporaryDirectory(prefix="sift-init-run-")
+            name = parse_skill_md(skill_path)[0]
+            run_inputs = prepare_run_bundle_mining_inputs(
+                cli_options.from_run,
+                name,
+                cli_options.kind,
+                Path(temporary_run.name),
+                include_unmatched=cli_options.trigger_probes,
+            )
+            calls = sum(len(session.call_ids) for session in run_inputs.sessions)
+            console.print(f"Run {run_inputs.run_id}: 命中 {len(run_inputs.sessions)} 个 session、{calls} 次调用")
+            for warning in run_inputs.warnings:
+                console.print(f"[yellow]⚠ {warning}[/yellow]")
+
         eval_set = _generate_init_evals(
             gen,
             skill_path,
             _existing_evals,
-            _InitGenerationOptions(cli_options.from_transcript, cli_options.kind, cli_options.generate_prompts),
+            _InitGenerationOptions(
+                cli_options.from_transcript, cli_options.kind, cli_options.generate_prompts, run_inputs
+            ),
         )
 
         _trim_init_evals(eval_set, cli_options.num_evals, cli_options.append, output)
@@ -163,7 +199,8 @@ def init(cli_options: InitCommandOptions):
                 eval_set,
                 _write_raw,
                 _InitProbeOptions(
-                    output, cli_options.append, skill_path, cli_options.num_evals, cli_options.from_transcript
+                    output, cli_options.append, skill_path, cli_options.num_evals, cli_options.from_transcript,
+                    run_inputs,
                 ),
             )
 
@@ -177,6 +214,9 @@ def init(cli_options: InitCommandOptions):
     except SiftError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
+    finally:
+        if temporary_run is not None:
+            temporary_run.cleanup()
 
 
 def _resolve_evals_output(skill_path, output):
@@ -348,8 +388,15 @@ def _degraded_cases(evals):
 
 def _generate_init_evals(gen, skill_path: Path, _existing_evals, options: _InitGenerationOptions):
     """按 transcript、LLM 或模板路径生成考题。"""
-    from_transcript, kind, generate_prompts = options
-    if from_transcript:
+    from_transcript, kind, generate_prompts, run_inputs = options
+    if run_inputs is not None:
+        eval_set = gen.generate_from_run(
+            skill_path,
+            [(session.session_id, session.scoped_path) for session in run_inputs.sessions],
+            kind,
+            on_heartbeat=lambda m: console.print(m),
+        )
+    elif from_transcript:
         if not kind:
             _warn_transcript_generation_scope(from_transcript)
         console.print((f"Mining evals from transcript [bold]{from_transcript}[/bold]..."))
@@ -397,7 +444,7 @@ def _trim_init_evals(eval_set, num_evals: int | None, append: bool, output: Path
 
 def _generate_init_probes(gen, eval_set, _write_raw, options: _InitProbeOptions):
     """追加触发探题，保留已有评分题和 raw 字段。"""
-    output, append, skill_path, num_evals, from_transcript = options
+    output, append, skill_path, num_evals, from_transcript, run_inputs = options
     if output.exists() and not append:
         from sift.models import EvalSet
 
@@ -407,10 +454,13 @@ def _generate_init_probes(gen, eval_set, _write_raw, options: _InitProbeOptions)
             console.print((f"[yellow]⚠️ 读已有 {output} 失败,trigger 探题将附加到新生成的 evals。[/yellow]"))
     with console.status("正在生成 trigger 探题…", spinner="dots"):
         generated_probes = gen.generate_trigger_probes(skill_path, num_each=(num_evals or 5))
-    # trace-mined 负例:配 --from-transcript 才挖(真实会话里领域相邻且未触发本
+    # trace-mined 负例:配历史会话输入才挖(真实会话里领域相邻且未触发本
     # skill 的用户 query → should-not 真题;单给 --trigger-probes 维持纯生成)。
     mined_probes = []
-    if from_transcript:
+    if run_inputs is not None:
+        with console.status(f"正在从 run {run_inputs.run_id} 挖 trigger 负例…", spinner="dots"):
+            mined_probes = gen.mine_trigger_probes_from_transcripts(skill_path, list(run_inputs.probe_paths))
+    elif from_transcript:
         with console.status(f"正在从 {from_transcript} 挖 trigger 负例…", spinner="dots"):
             mined_probes = gen.mine_trigger_probes(skill_path, from_transcript)
     if num_evals:  # 每方向上限 trim(不补下限);只 trim 生成的——真题不受生成上限约束

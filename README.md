@@ -112,6 +112,7 @@ LLM 自动生成 L1/L2 测试用例，自动推导程序化断言。也可从真
 ```bash
 sift init path/to/skill/
 sift init path/to/skill/ --from-transcript session.jsonl   # 从真实会话挖题
+sift init path/to/skill/ --from-run path/to/run-bundle --kind skill  # 从导出的 run 包挖题
 sift init path/to/skill/ --focus negative-cases --append   # 定向补反面场景,追加到已有考卷
 sift init path/to/skill/ --trigger-probes                  # 生成触发准确度探题(should/should-not)
 sift init path/to/skill/ --trigger-probes --from-transcript session.jsonl # 附带从真实会话挖误触发真题
