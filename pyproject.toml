@@ -34,3 +34,6 @@ pythonpath = ["src"]
 markers = [
     "e2e: 真进程/真网络 opt-in 用例(真 CLI + auth + LLM 调用)——默认排除,SIFT_RUN_E2E=1 或 -m e2e 单独跑",
 ]
+
+[tool.setuptools.package-data]
+sift = ["reporting/templates/*.html", "config/defaults.yaml", "scoring/templates/*.md"]

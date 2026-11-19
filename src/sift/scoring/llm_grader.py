@@ -76,7 +76,7 @@ class LLMGrader:
 
     @staticmethod
     def _load_prompt_template() -> str:
-        prompt_path = Path(__file__).parent.parent.parent.parent / "agents" / "grader.md"
+        prompt_path = Path(__file__).parent / "templates" / "grader.md"
         if prompt_path.exists():
             return prompt_path.read_text(encoding="utf-8")
         return ""
