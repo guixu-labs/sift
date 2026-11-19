@@ -138,6 +138,7 @@ def init(cli_options: InitCommandOptions):
         # append 模式:提前读现有 evals。生成阶段喂 _existing_evals(定向补题 + 语义去重,
         # 治半聚焦/不去重);合并阶段复用 _existing_raw 保原题字节。读失败 → 降级覆盖写。
         _existing_raw, _existing_evals = _load_existing_evals(cli_options.append, output)
+        gen.existing_evals = _existing_evals
 
         # --kind 通验(声明类型:生成时选 skill/agent 出题路径;配 --from-transcript 选挖掘作用域)
         if cli_options.kind is not None and cli_options.kind not in ("skill", "agent"):
@@ -173,7 +174,10 @@ def init(cli_options: InitCommandOptions):
             json.dumps(data, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        _print_generated_evals(eval_set, gen, output, appended, new_evals_display)
+        _print_generated_evals(
+            eval_set, gen, output, appended, new_evals_display,
+            append_mode=cli_options.append and _existing_raw is not None,
+        )
     except SiftError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
@@ -218,7 +222,17 @@ def _append_generated_evals(append, _existing_raw, eval_set):
 
         existing = EvalSet.model_validate(_existing_raw)
         next_id = max((e.id for e in existing.evals), default=0) + 1
-        new_evals = list(eval_set.evals)
+        seen = {
+            json.dumps(case.model_dump(mode="json", exclude={"id"}), sort_keys=True, ensure_ascii=False)
+            for case in existing.evals
+        }
+        new_evals = []
+        for case in eval_set.evals:
+            key = json.dumps(case.model_dump(mode="json", exclude={"id"}), sort_keys=True, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            new_evals.append(case)
         for e in new_evals:
             e.id = next_id
             next_id += 1
@@ -425,12 +439,14 @@ def _generate_init_probes(gen, eval_set, _write_raw, options: _InitProbeOptions)
     return eval_set
 
 
-def _print_generated_evals(eval_set, gen, output: Path, appended: int, new_evals_display: list) -> None:
+def _print_generated_evals(
+    eval_set, gen, output: Path, appended: int, new_evals_display: list, *, append_mode: bool = False
+) -> None:
     """分别显示新增题数、合并总数、模型消耗和考题诊断。"""
     # B:append 模式终端只列新增(degraded / per-eval);非 append 列全量。
-    display_evals = new_evals_display if new_evals_display else eval_set.evals
+    display_evals = new_evals_display if append_mode else eval_set.evals
 
-    if appended:
+    if append_mode:
         # append 模式:显示「本次新增 N · 合并后 M」,不把合并总数当生成数(原 "Generated 12" 误导)
         console.print(
             (
@@ -450,7 +466,7 @@ def _print_generated_evals(eval_set, gen, output: Path, appended: int, new_evals
     tok = gen.llm_usage.get("input_tokens", 0) + gen.llm_usage.get("output_tokens", 0)
     if gen.llm_duration > 0 or tok:
         console.print((f"耗时 [bold]{gen.llm_duration:.1f}s[/bold] · {tok} tok"))
-    if appended:
+    if append_mode and appended:
         console.print((f"[green]Appended[/green] {appended} new evals to existing {output}(id 接续、原题保留)"))
     _print_eval_diagnostics(display_evals, gen, eval_set)
     console.print(f"Written to {output}")
