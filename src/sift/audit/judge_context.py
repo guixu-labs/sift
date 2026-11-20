@@ -84,7 +84,12 @@ class BatchJudgeOptions(NamedTuple):
     on_usage: Callable[[dict], None] | None = None
     label: str = ""
     schema: dict | None = None
-    transport: str = "cc"
+    # transport 决策链(resolve_llm_transport 单点):显式值 > SIFT_LLM_TRANSPORT >
+    # transport_default。None = 未显式指定 → env 可覆盖 site default;
+    # transport_default = site default(主判官批保持 cc 不传;http 优选的批
+    # ——headline/精筛/refine —— 显式传 "http"),无 env 时行为与历史逐字面一致。
+    transport: str | None = None
+    transport_default: str = "cc"
 
 
 class AuditFeatures(NamedTuple):

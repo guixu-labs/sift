@@ -144,24 +144,32 @@ def _strip_line_numbers(text: str) -> str:
 # 用 [ \t] 不用 \s,以免跨行吃换行。归本模块:_clean_read_result 按 <path> 起手 + <content> 包裹触发。
 _OC_LINE_NUM_RE = re.compile(r"^[ \t]*\d+:[ \t]?", re.MULTILINE)
 
+# opencode 2.x 实测(2026-11-19,2.0.24)的 read 输出头:"Read file <path>, lines A-B"。
+# 与 1.x 的 <content> 包裹形并存,双格式各走各的识别规则。
+_OC2_READ_HEADER_RE = re.compile(r"^Read file .+, lines \d+-\d+\n")
+
 
 def _clean_read_result(text: str) -> str:
     """归一 Read 工具结果到干净文件内容(三源通用,canonical 重建器 ``_digest_from_records`` 调用)。
 
-    按输出**起手** + ``<content>`` 包裹区分格式:opencode read 恒以 ``<path>`` 起手、cc read
-    恒以行号 ``\\d+\\t`` 起手——首字符就分化,比"任意位置含某字面"稳得多:
-    - opencode 形(``<path>…</path>\\n<type>…</type>\\n<content>…</content>`` + ``N: `` 行号)→
+    按输出**起手** + 包裹/头区分格式:opencode read 恒以 ``<path>``(1.x)或 ``Read file ``(2.x)
+    起手、cc read 恒以行号 ``\\d+\\t`` 起手——首字符就分化,比"任意位置含某字面"稳得多:
+    - opencode 1.x 形(``<path>…</path>\\n<type>…</type>\\n<content>…</content>`` + ``N: `` 行号)→
       剥 ``<content>`` 取内文 + 去 ``N: `` 行号 + 去前导换行;
+    - opencode 2.x 形(``Read file <path>, lines A-B\\n`` 头 + ``N: `` 行号)→ 去 头 + 去 ``N: ``
+      行号。**严格双条件**(头正则 + 首行内容确为行号形)防正文误伤:正文恰以同形字面起手
+      且次行恰为 ``N: `` 的概率可忽略;
     - cc 形(``\\d+\\t`` 行号)或裸内容 → 只去 cc tab 行号(``_strip_line_numbers``)。
 
-    靠"``<path>`` 起手"识别 opencode,cc / 干净内容不会被 ``N: `` 正则误伤——cc 正文里合法的
-    "1: ..." 文本、乃至正文含 ``<content>``/``<path>`` 字面的文件都保留(只要不以 ``<path>``
-    起手)。structured(insight 等)直喂 opencode 形 read,经此与 opencode 原生路等价;裸 ``N:``
-    (无包裹)走 cc 路保留。
+    靠起手字面识别 opencode,cc / 干净内容不会被 ``N: `` 正则误伤——cc 正文里合法的
+    "1: ..." 文本、乃至正文含 ``<content>``/``<path>`` 字面的文件都保留(只要不以这些
+    字面起手)。structured(insight 等)直喂 opencode 形 read,经此与 opencode 原生路等价;
+    裸 ``N:``(无包裹/头)走 cc 路保留。
 
-    格式耦合(已知局限):判定绑 opencode ``<path>`` 起手这一字面。根因是 structured 路径可能
-    喂 opencode 形 read、共享层无法靠来源判定只能嗅探内容——彻底解耦要给 canonical record 加
-    来源标记位(大 refactor),opencode 无改格式迹象前不值,留心。
+    格式耦合(已知局限):判定绑 opencode ``<path>``(1.x)/``Read file ``(2.x)起手这些
+    字面。根因是 structured 路径可能喂 opencode 形 read、共享层无法靠来源判定只能嗅探
+    内容——彻底解耦要给 canonical record 加来源标记位(大 refactor),opencode 改格式
+    迹象已发生过一次(1.x→2.x),再变时优先考虑标记位方案。
     """
     if text.startswith("<path>") and "<content>" in text and "</content>" in text:
         i = text.find("<content>") + len("<content>")
@@ -169,6 +177,9 @@ def _clean_read_result(text: str) -> str:
         if 0 <= i <= j:
             text = text[i:j]
         return _OC_LINE_NUM_RE.sub("", text).lstrip("\n")
+    header = _OC2_READ_HEADER_RE.match(text)
+    if header and _OC_LINE_NUM_RE.match(text, header.end()):
+        return _OC_LINE_NUM_RE.sub("", text[header.end():])
     return _strip_line_numbers(text)
 
 

@@ -74,6 +74,15 @@ def test_llm_http_call_other_code_still_runtime_error(monkeypatch):
         )
 
 
+def _pin_which(monkeypatch, present):
+    """写死 which 探测(桥接层测试环境无关):present 里的名字视为已装,其余缺位。
+
+    http→cc 回退支线现在查兜底表(缺 claude 时转 opencode),不写死的话测试结果随
+    本机装了什么 CLI 而抖。
+    """
+    monkeypatch.setattr(utils.shutil, "which", lambda name: f"/fake/{name}" if name in present else None)
+
+
 def test_call_claude_http_rate_limited_not_falling_back(monkeypatch):
     """429 透传,不回退 cc(同账号同限,cc 也撞)。"""
     monkeypatch.setattr(utils, "call_http", _raise(utils.HttpRateLimited("429")))
@@ -86,6 +95,7 @@ def test_call_claude_http_rate_limited_not_falling_back(monkeypatch):
 
 def test_call_claude_http_throttled_falls_back_to_cc(monkeypatch):
     """529 回退 cc(dispatcher 既有行为,回归)。"""
+    _pin_which(monkeypatch, {"claude"})  # claude 在 → 回退目标维持 cc(兜底表不介入)
     monkeypatch.setattr(utils, "call_http", _raise(utils.HttpThrottled("529")))
     monkeypatch.setattr(utils, "call_cli", lambda *a, **k: "cc-result")
     assert utils.call_claude(prompt="prompt", config=LLMCallConfig(model="m", transport="http")) == "cc-result"
@@ -98,6 +108,7 @@ def test_no_tool_use_not_runtime_error_subclass():
 
 def test_call_claude_http_no_tool_use_falls_back_to_cc(monkeypatch):
     """forced tool_use 拿不到(GLM 只回 thinking / 撑满 max_tokens)→ HttpNoToolUse → 回退 cc。"""
+    _pin_which(monkeypatch, {"claude"})  # claude 在 → 回退目标维持 cc(兜底表不介入)
     monkeypatch.setattr(
         utils,
         "call_http",
@@ -112,6 +123,7 @@ def test_call_claude_http_fallback_reports_progress(monkeypatch):
     不报行的话前后连起来整段静默像挂死)。429 不回退(既有行为)也不报行。
     """
     lines = []
+    _pin_which(monkeypatch, {"claude"})  # claude 在 → 回退目标维持 cc(兜底表不介入)
     monkeypatch.setattr(
         utils,
         "call_http",

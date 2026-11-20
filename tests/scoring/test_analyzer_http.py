@@ -54,7 +54,9 @@ class TestAnalyzerCallHttp:
         fake, cap = self._fake('["note"]')
         with patch("sift.scoring.client.call_llm_with_retry", side_effect=fake):
             PosthocAnalyzer().client.complete("prompt", schema=ANALYSIS_SCHEMA)
-        assert cap[0]["transport"] == "http"
+        # site default http 已下沉到 call_llm_with_retry 内部(resolve_llm_transport,
+        # SIFT_LLM_TRANSPORT 可覆盖)——调用方不再显式传参,锁「无显式 transport」。
+        assert cap[0].get("transport") is None
 
     def test_analyze_comparison_passes_analysis_schema(self):
         fake, cap = self._fake("{}")

@@ -24,7 +24,6 @@ class ScoringClient:
                 timeout=self.timeout,
                 schema=self.default_schema if schema is None else schema,
                 on_usage=on_usage,
-                transport="http",
             )
         except LLMRetryExhausted:
             return ""

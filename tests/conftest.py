@@ -49,3 +49,15 @@ def _isolate_refine_cache_dir(monkeypatch, tmp_path):
 def no_llm_retry_wait(monkeypatch) -> None:
     """仅由明确选择它的测试关闭重试退避，不影响并发计时测试。"""
     monkeypatch.setattr("sift.audit.auditor.time.sleep", lambda *args, **kwargs: None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_transport_fallback_announcements():
+    """每个测试清空转接播报去重集，避免跨测试泄漏让后测的 warning 断言失真。
+
+    ``llm_transport._announce_transport_fallback`` 对同一条转接进程内只打一次
+    (防判官批多批重试刷屏)；该去重是模块级状态，须 function-scoped 清零。
+    """
+    from sift import llm_transport
+
+    llm_transport._announced_transport_fallbacks.clear()

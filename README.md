@@ -191,7 +191,11 @@ sift run path/to/skill/ --task "重构 X 模块" --cwd ./repo --executor dsh    
 
 关键参数：`--task`（必填，真任务文本）、`--cwd`（工作目录，拷贝隔离）、`--executor`（`cc`（默认）/ `opencode` / `dsh` / 逗号分隔多执行器）、`--runs`（每任务次数）、`--model`、`--timeout`、`--max-turns`、`-o`、`--security-gate`。
 
-DSH 执行器通过 `SIFT_DSH_BIN`（默认 `dsh`）和 `SIFT_DSH_PROFILE`（默认 `headless`）选择二进制与 profile。DSH 自己负责执行器模型和凭据；`SIFT_LLM_TRANSPORT` 控制 SIFT 自己的评分/分析调用，支持 `cc`（默认）/ `http` / `dsh`。设置 `SIFT_LLM_TRANSPORT=dsh` 时，SIFT 内部 LLM 调用也通过当前 DSH headless profile 完成。
+DSH 执行器通过 `SIFT_DSH_BIN`（默认 `dsh`）和 `SIFT_DSH_PROFILE`（默认 `headless`）选择二进制与 profile。DSH 自己负责执行器模型和凭据；`SIFT_LLM_TRANSPORT` 控制 SIFT 自己的评分/分析/判官调用，支持 `cc` / `http` / `dsh` / `opencode`，决策链全局统一：显式调用点配置 > `SIFT_LLM_TRANSPORT` > 调用点默认（audit 判官批家族默认 `http`、文本模式默认 `cc`），设置后一键全局切换、无按路径漏网的死角。`SIFT_LLM_TRANSPORT=dsh` 时内部 LLM 调用走当前 DSH headless profile；`SIFT_LLM_TRANSPORT=opencode` 时走 `opencode run --standalone`（判官模型随 opencode 配置走，与智谱 `ANTHROPIC_*` 绑定解耦；`--model` 只认 `provider/model` 形态，裸名走 opencode 配置的默认模型）。判官 opencode 通道结构性禁用工具（判官只准用 prompt 内证据下判，防模型跑工具拿带外证据）、隔离 XDG 跑（不污染本机 opencode 会话库）；schema 靠 prompt 内嵌指令 + 严格校验（与 dsh 同型），无 forced 结构化输出保证。
+
+**静态缺位兜底（桥接）**：resolved 为 cc 而 claude CLI 不在 PATH 时自动转 opencode（转必可见，打一行提示并附固定方式；显式指定的引擎缺位则如实报错、不静默换源——他要的是那个引擎的模型语义）；判官批 http→cc 的回退支线同表驱动（cc 缺位时回退 opencode，不再变死路）。CLI 静态缺位属永久错误，重试壳立即失败不烧退避空转。桥接后未指定 model 时走 opencode 配置的默认模型——**桥接的机器需在 opencode 配置顶层设 `"model"` 字段**（如 `"gateway/glm-5.3"`；不设则 opencode 内置默认可能不可用，报错会附修法提示）。
+
+**OpenCode 版本支持矩阵**：opencode 1.x 与 2.x 的 CLI 命令面不兼容（2.x 删除顶层 `export` 子命令、`run` 默认连后台共享 service、`--dir` 被移除），sift 运行时按 `opencode --version` 自动分叉命令构造——**执行器（`run --executor opencode`）与审计入口（`audit --db`）双版本支持（1.x 实测 1.19.5 / 2.x 实测 2.0.24）**；**判官 transport（`SIFT_LLM_TRANSPORT=opencode`）仅支持 ≥ 2.0**（`--standalone` 私有 server、agent V2 定义、2.x 事件流均无 1.x 对应物，1.x 上如实报 TransportUnavailable 并提示改用 `cc`/`http`/`dsh`）。版本探不出的环境直接报错原文，不猜默认。
 
 ### `gate` — 通过/失败判决
 
@@ -206,7 +210,7 @@ sift gate output/benchmark.json --min-win-rate 0.5  # 加主观盲评阈值
 
 ### `audit` — 真实 transcript 对账
 
-把真实会话 transcript 与 SKILL.md 对账，判指令遵循性。不 re-run，直接对账历史执行（支持多 transcript 聚合）。对账对象默认是整条 transcript（不带 `--kind` 的宽松全 session 模式，skill/agent/root 声明共同默认）；带 `--kind` 精确收窄到三类作用域之一：**skill**（被 `Skill` 调用）/ **agent**（被 dispatch 的子 agent）/ **root**（顶层主 agent / 编排者）。不传但 transcript 含可收窄锚点时黄字对称提示可加 `--kind`（非阻断）。`--transcript` 吃 cc 会话 `.jsonl` 或 **opencode session `.json`**（`opencode export <sessionID>` 导出；按格式自动分派);或直接给 opencode **`.db` 文件**(`--db`,内部自动 list/export/audit,单 session 自动选、多个列出让你挑)。可选 `--suggest` 对 FAIL 做三类归因并起草改 skill / 改声明建议(默认关,审计保持纯判决,建议仅供参考)。
+把真实会话 transcript 与 SKILL.md 对账，判指令遵循性。不 re-run，直接对账历史执行（支持多 transcript 聚合）。对账对象默认是整条 transcript（不带 `--kind` 的宽松全 session 模式，skill/agent/root 声明共同默认）；带 `--kind` 精确收窄到三类作用域之一：**skill**（被 `Skill` 调用）/ **agent**（被 dispatch 的子 agent）/ **root**（顶层主 agent / 编排者）。不传但 transcript 含可收窄锚点时黄字对称提示可加 `--kind`（非阻断）。`--transcript` 吃 cc 会话 `.jsonl` 或 **opencode session `.json`**（`opencode session export <sessionID>` 导出，opencode 1.x/2.x 两种导出格式都认；按格式自动分派);或直接给 opencode **`.db` 文件**(`--db`,内部自动 list/export/audit,单 session 自动选、多个列出让你挑)。可选 `--suggest` 对 FAIL 做三类归因并起草改 skill / 改声明建议(默认关,审计保持纯判决,建议仅供参考)。
 
 ```bash
 sift audit path/to/skill/ --transcript run-1/transcript.jsonl

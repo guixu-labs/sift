@@ -354,13 +354,13 @@ sift audit path/to/skill/ --transcript run-1/transcript.jsonl -o audit-out/
 sift audit path/to/skill/ --transcript a.jsonl --transcript b.jsonl --format json
 # transcript 里用了多个 skill,只对账本 skill 被调用的段(按 Skill 工具调用切分):
 sift audit path/to/skill/ --transcript big-multi-skill.jsonl --kind skill
-# opencode 跑出的 session(`opencode export <sessionID>` 导出,顶层 info/messages、parts 嵌在 message 里):
+# opencode 跑出的 session(`opencode session export <sessionID>` 导出,1.x/2.x 两种格式都认;2.x 顶层 info/messages、消息顶层 type/text/content):
 sift audit path/to/skill/ --transcript opencode-session.json
 # 直接给 opencode .db 文件(内部自动 list/export/audit;单 session 自动选,多个列出让你挑):
 sift audit path/to/skill/ --db opencode.db
 ```
 
-> **`--transcript` 吃两种格式(按后缀自动分派)**：cc 会话 `.jsonl`(逐行 JSON 记录,含 `Skill`/`Read`/`Write`/`Bash` tool_use);opencode session `.json`(`opencode export <sessionID>` 的产出,顶层 `info`/`messages`,parts 嵌在 message 里、role/agent 在 `message.info`)。两者重建成同一 `SessionDigest` 再对账(经同一条 canonical 重建路径:归一到 cc-record 形 → 共享 `_digest_from_records`,三源重建逻辑单处定义);`--kind` 选锚点(`skill` 按 `Skill` tool_use、`agent` 按 `agent` 归属);opencode 单锚点,按 per-message `agent` 切分(扁平,无 cc 父子作用域,`skill`/`agent` 的区分对它无意义、都按 `agent` 切)。`run --task` 两种执行器都支持(默认 `cc` 产 `.jsonl`,`--executor opencode` 产 `.json`),run 产的 transcript 直接喂 audit 即可。生产导出 opencode 会话喂 audit:`opencode session list` 找 id → `opencode export <id> > session.json`(**导原文**,audit 靠 part.text 判遵循性;`--sanitize` 仅用于对外分享脱敏版,脱敏后别喂 audit)→ `sift audit --transcript session.json`。
+> **`--transcript` 吃两种格式(按后缀自动分派)**：cc 会话 `.jsonl`(逐行 JSON 记录,含 `Skill`/`Read`/`Write`/`Bash` tool_use);opencode session `.json`(`opencode session export <sessionID>` 的产出,顶层 `info`/`messages`;**1.x/2.x 两种导出格式都认**——2.x 消息改用顶层 `type`/`text`/`content`、无 session 级 agent,sift 加载时单点归一,对账语义不变)。两者重建成同一 `SessionDigest` 再对账(经同一条 canonical 重建路径:归一到 cc-record 形 → 共享 `_digest_from_records`,三源重建逻辑单处定义);`--kind` 选锚点(`skill` 按 `Skill` tool_use、`agent` 按 `agent` 归属);opencode 单锚点,按 per-message `agent` 切分(扁平,无 cc 父子作用域,`skill`/`agent` 的区分对它无意义、都按 `agent` 切)。`run --task` 两种执行器都支持(默认 `cc` 产 `.jsonl`,`--executor opencode` 产 `.json`),run 产的 transcript 直接喂 audit 即可。生产导出 opencode 会话喂 audit(opencode 2.x):`opencode session list` 找 id → `opencode session export <id> > session.json`(**导原文**,audit 靠 part.text 判遵循性;`--sanitize` 仅用于对外分享脱敏版,脱敏后别喂 audit)→ `sift audit --transcript session.json`。
 
 > **拿到一个 opencode `.db` 文件,一行进 audit**(别人/别处拷来的库,不是你本机默认库):直接用 `--db`,sift 内部把 list/export/audit 全包了(隔离 `XDG_DATA_HOME` 指向那个 .db、**不碰本机真库**;需 opencode CLI 在 PATH):
 > ```bash
@@ -371,13 +371,14 @@ sift audit path/to/skill/ --db opencode.db
 > ```bash
 > # 1. 把 .db 摆成 opencode 认的布局(<envdir>/opencode/opencode.db;库大可 ln -s 软链代替 cp)
 > mkdir -p /tmp/ocenv/opencode && cp /path/to/handed.db /tmp/ocenv/opencode/opencode.db
-> # 2. 用 XDG_DATA_HOME 指向它,列 session 找 id
-> XDG_DATA_HOME=/tmp/ocenv opencode session list
-> # 3. 导出目标 session → audit(**导原文**,audit 靠 part.text 判遵循性;脱敏版会变 [redacted:text:…] → 审计降级。要脱敏分享另跑 opencode export --sanitize,别喂给 audit)
-> XDG_DATA_HOME=/tmp/ocenv opencode export ses_xxxx > session.json
+> # 2. 用 XDG_DATA_HOME 指向它,列 session 找 id(opencode 2.x:本机有后台 service 在跑时必须
+> #    --standalone,否则客户端 XDG 被忽略、读的是本机真库)
+> XDG_DATA_HOME=/tmp/ocenv opencode session list --standalone
+> # 3. 导出目标 session → audit(**导原文**,audit 靠 part.text 判遵循性;脱敏版会变 [redacted:text:…] → 审计降级。要脱敏分享另跑 opencode session export --sanitize,别喂给 audit)
+> XDG_DATA_HOME=/tmp/ocenv opencode session export --standalone ses_xxxx > session.json
 > sift audit path/to/skill/ --transcript session.json
 > ```
-> 若 .db **就是你本机 opencode 跑的**(默认位置),跳过 XDG,直接 `opencode session list` → `opencode export <id>` → audit。
+> 若 .db **就是你本机 opencode 跑的**(默认位置),跳过 XDG,直接 `opencode session list` → `opencode session export <id>` → audit。
 
 **参数**：
 

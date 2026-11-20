@@ -11,7 +11,7 @@ from typing import Optional
 
 import typer
 
-from sift.cli.helpers import _check_claude_or_exit, _discover_evals
+from sift.cli.helpers import _check_claude_or_exit, _check_opencode_or_exit, _discover_evals
 from sift.cli.main import app, console
 from sift.cli.options import options_command
 from sift.evals.prompt_sections import AGENT_SOURCE_HEADER
@@ -129,6 +129,8 @@ def _choose_new_eval(cli_options, skill_path):
             raise typer.Exit(code=3) from exc
         if transport == "cc":
             _check_claude_or_exit()
+        elif transport == "opencode":
+            _check_opencode_or_exit()
         usage: dict = {}
         start = time.perf_counter()
         if cli_options.kind == "agent":

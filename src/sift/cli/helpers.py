@@ -63,6 +63,18 @@ def _check_dsh_or_exit() -> None:
     raise typer.Exit(code=3)
 
 
+def _check_opencode_or_exit() -> None:
+    """SIFT_LLM_TRANSPORT=opencode 时,出题前确认 opencode CLI 在 PATH(与 _check_claude_or_exit 对偶)。"""
+    if shutil.which("opencode"):
+        console.print("[dim]LLM transport: opencode[/dim]")
+        return
+    console.print(
+        "[red]Error:[/red] opencode CLI 未找到;SIFT_LLM_TRANSPORT=opencode 需先装 opencode 并确保在 PATH"
+        "(https://opencode.ai)"
+    )
+    raise typer.Exit(code=3)
+
+
 def _discover_evals(skill_path: Path) -> Path:
     for candidate in [skill_path / "evals" / "evals.json", skill_path / "evals.json"]:
         if not (candidate.exists()):

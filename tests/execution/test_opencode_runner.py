@@ -60,7 +60,7 @@ class _FakeProc:
 @pytest.fixture
 def patched_spawn(monkeypatch, tmp_path):
     """patch Popen/which/run_opencode/isolated_xdg_env_empty;返回捕获 dict。"""
-    cap = {"popen_args": None, "popen_kwargs": None, "run_calls": [], "which": "/fake/opencode"}
+    cap = {"popen_args": None, "popen_kwargs": None, "run_calls": [], "which": "/fake/opencode", "version": (2, 0, 24)}
 
     def fake_popen(args, **kwargs):
         cap["popen_args"] = list(args)
@@ -72,9 +72,14 @@ def patched_spawn(monkeypatch, tmp_path):
 
     def fake_run_opencode(xdg, args, timeout=120):
         cap["run_calls"].append(list(args))
+        # 2.x 全量 API 通道列 session(CLI session list 按 cwd 项目过滤,列不到隔离库)
+        if args[:3] == ["api", "--standalone", "GET"]:
+            data = cap.get("api_sessions", [{"id": "ses_abc", "time": {"updated": 200}}])
+            return json.dumps({"data": data, "cursor": {"next": None}})
+        # 1.x:CLI session list 即全量
         if args[:2] == ["session", "list"]:
-            return json.dumps([{"id": "ses_abc", "title": "t"}])
-        if args[0] == "export":
+            return json.dumps(cap.get("list_sessions", [{"id": "ses_abc", "updated": 200}]))
+        if args[:2] == ["session", "export"] or args[0] == "export":
             return (
                 '{"info": {"tokens": {"input": 4993}}, "messages": [{"info": {"role": '
                 '"user"}, "parts": [{"type": "text", "text": "hi"}]}, {"info": {"role": '
@@ -85,7 +90,10 @@ def patched_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(ocr.shutil, "which", fake_which)
     monkeypatch.setattr(ocr, "run_opencode", fake_run_opencode)
-    monkeypatch.setattr(ocr, "isolated_xdg_env_empty", lambda: _yield_ctx(tmp_path))
+    monkeypatch.setattr(ocr, "isolated_xdg_env_seeded", lambda: _yield_ctx(tmp_path))
+    # 版本探测写死(默认 2.0.24;单测置 cap["version"] 切 1.x 分支)——1.x/2.x 命令面
+    # 分叉按版本判定,测试不能依赖本机装的是哪代。
+    monkeypatch.setattr(ocr, "opencode_version", lambda: cap["version"])
     return cap
 
 
@@ -96,18 +104,62 @@ def test_run_builds_cmd_and_exports_raw(patched_spawn, tmp_path):
         options=ExecutionOptions(model="zai-anthropic/glm-5.2", cwd=tmp_path, timeout=30),
     )
     a = patched_spawn["popen_args"]
-    assert a[0:4] == ["opencode", "run", "--format", "json"]
+    # opencode 2.x:--standalone(私有 server,XDG 隔离前提)+ 无 --dir(已移除,目录走进程 cwd)
+    assert a[0:5] == ["opencode", "run", "--standalone", "--format", "json"]
     assert "--dangerously-skip-permissions" in a
-    assert "--dir" in a and str(tmp_path) in a
+    assert "--dir" not in a
+    assert patched_spawn["popen_kwargs"]["cwd"] == str(tmp_path)  # 目录经进程 cwd 控制
     assert "-m" in a and "zai-anthropic/glm-5.2" in a  # 含 / → 传
     assert a[-1] == "do it"  # prompt 末位
-    export_call = [c for c in patched_spawn["run_calls"] if c[0] == "export"][0]
-    assert export_call == ["export", "ses_abc"]
+    export_call = [c for c in patched_spawn["run_calls"] if c[:2] == ["session", "export"]][0]
+    assert export_call == ["session", "export", "--standalone", "ses_abc"]
     assert "--sanitize" not in export_call  # 原文,不脱敏
     assert json.loads(out.stdout)["messages"][1]["parts"][0]["text"] == "PONG"
     assert out.total_tokens == 7300
     assert out.stop_reason == "stop"
     assert out.num_turns == 1  # _STREAM_LINES 恰好 1 个 step_finish
+
+
+def test_run_v1_command_form_and_export(patched_spawn, tmp_path):
+    """1.x(1.19.5 形态):run 无 --standalone、有 --dir;export 走 CLI session list
+    + 顶层 export(main 原形态)。"""
+    patched_spawn["version"] = (1, 19, 5)
+    ocr.OpenCodeRunner().run(
+        prompt="do it", skill_path=None,
+        options=ExecutionOptions(model="zai-anthropic/glm-5.2", cwd=tmp_path, timeout=30),
+    )
+    a = patched_spawn["popen_args"]
+    assert a[0:4] == ["opencode", "run", "--format", "json"]
+    assert "--standalone" not in a, "1.x 无后台共享 service,standalone 不存在"
+    assert "--dir" in a and a[a.index("--dir") + 1] == str(tmp_path)
+    assert a[-1] == "do it"
+    calls = patched_spawn["run_calls"]
+    assert ["session", "list", "--format", "json"] in calls
+    assert ["export", "ses_abc"] in calls, "1.x 顶层 export 子命令(2.x 已删)"
+    assert not any(c[:2] == ["session", "export"] for c in calls)
+
+
+def test_run_v2_export_skips_parentid_child_session(patched_spawn, tmp_path):
+    """评审复现:主会话 updated=100、子会话(parentID)updated=200 → 按 updated 取最新
+    会误选 child。剔除子会话后必须导主会话(否则审计丢主任务记录)。"""
+    patched_spawn["api_sessions"] = [
+        {"id": "ses_child", "parentID": "ses_main", "time": {"updated": 200}},
+        {"id": "ses_main", "time": {"updated": 100}},
+    ]
+    ocr.OpenCodeRunner().run(prompt="t", skill_path=None, options=ExecutionOptions(cwd=tmp_path, timeout=30))
+    export_call = [c for c in patched_spawn["run_calls"] if c[:2] == ["session", "export"]][0]
+    assert export_call[3] == "ses_main", "parentID 子会话必须被剔除"
+
+
+def test_run_v2_export_all_children_falls_back_to_latest(patched_spawn, tmp_path):
+    """极端情形:列出的全是子会话 → 不空手而归,如实导最新子会话(错误可见好排)。"""
+    patched_spawn["api_sessions"] = [
+        {"id": "ses_c1", "parentID": "ses_x", "time": {"updated": 50}},
+        {"id": "ses_c2", "parentID": "ses_x", "time": {"updated": 90}},
+    ]
+    ocr.OpenCodeRunner().run(prompt="t", skill_path=None, options=ExecutionOptions(cwd=tmp_path, timeout=30))
+    export_call = [c for c in patched_spawn["run_calls"] if c[:2] == ["session", "export"]][0]
+    assert export_call[3] == "ses_c2"
 
 
 def test_run_bare_model_skipped(patched_spawn, tmp_path):
@@ -154,8 +206,9 @@ def test_run_timeout_kills_process_group_and_raises(monkeypatch, tmp_path):
 
     killed_gids = []
     monkeypatch.setattr(ocr.shutil, "which", lambda name: "/fake/opencode")
+    monkeypatch.setattr(ocr, "opencode_version", lambda: (2, 0, 24))
     monkeypatch.setattr(ocr, "run_opencode", lambda *a, **k: json.dumps([{"id": "ses_x"}]))
-    monkeypatch.setattr(ocr, "isolated_xdg_env_empty", lambda: _yield_ctx(tmp_path))
+    monkeypatch.setattr(ocr, "isolated_xdg_env_seeded", lambda: _yield_ctx(tmp_path))
     monkeypatch.setattr(ocr.os, "killpg", lambda gid, sig: killed_gids.append((gid, sig)))
     # start_new_session=True → 子进程是自己的组长,os.getpgid(child_pid) == child_pid;
     # 真实 getpgid 对假 pid 会抛 ProcessLookupError 被 runner 吞掉走 kill 分支,测不到 killpg,

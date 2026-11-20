@@ -1,8 +1,11 @@
 """opencode session(JSON)→ SessionDigest:把 opencode export 导出的单 session 解析成 digest。
 
-**格式 = ``opencode export <sessionID>`` 的真实产出**(与 cc fixture 用真 cc jsonl 同理,
+**格式 = ``opencode session export`` 的真实产出**(与 cc fixture 用真 cc jsonl 同理,
 用真 opencode export 格式,非自造):顶层 ``{info, messages}``,messages 各带嵌套 ``parts``
 (``message.info`` 含 role/agent),part 的 ``state`` 一体含 input+output。
+**opencode 2.x 的形状变化由 ``load_opencode_session`` 单点垫片归一回 1.x 内存形状**
+(2.x:消息顶层 ``type``/``text``/``content``、tool part 名在 ``name``、输出在
+``state.content[].text``、无 session 级 agent —— 细节见其 docstring),下游零改动。
 
 **走 canonical 重建路径**(与 cc / structured 同一重建器,非平行派):``_records_from_opencode``
 把 export 归一成 cc-record 形(工具名小写归大写、camelCase 字段映回 snake_case),再喂共享
@@ -51,15 +54,113 @@ def transcript_source(path: Path) -> str:
 
 
 def load_opencode_session(path: Path) -> dict:
-    """读 export JSON,返回 {info, messages}(messages 按 info.time.created 排序;export 本
-    已有序,此为保险)。
+    """读 export JSON,返回统一为 1.x 内存形状的 {info, messages}(messages 按时间排序)。
+
+    **opencode 2.x 形状垫片(2026-11-19 spike 实测 2.0.24)**:2.x 的 ``session export``
+    形状大变 —— 消息用顶层 ``type``("user"/"assistant"/"idle")替代 ``info.role``、
+    user 文本在顶层 ``text``、assistant 内容在 ``content``、tool part 名字在 ``name``
+    (1.x 是 ``tool``)、工具输出在 ``state.content[].text``(1.x 是 ``state.output``
+    字符串)、session.info **不再有** ``agent``(agent 按消息给)。这里统一归一回
+    1.x 形状 —— 下游 build_digest / slice_by_agent / aux trace / audit ``--kind root``
+    全部零改动;1.x 形状原样透传(幂等,切片重建再读不受影响)。
+
+    2.x 无 session 级 agent → 取 assistant 消息里**出现最多**的 agent 当主 agent
+    (skill_used / --kind root / aux trace 的 main agent 判定都靠它;普通任务全
+    message 同 agent,task 子代理只占少数,众数即主)。
     """
     data = json.loads(path.read_text(encoding="utf-8"))
-    msgs = sorted(
-        data.get("messages") or [],
-        key=lambda m: ((m.get("info") or {}).get("time") or {}).get("created", 0),
-    )
-    return {"info": data.get("info") or {}, "messages": msgs}
+    msgs = [
+        norm
+        for norm in (
+            _normalize_opencode_v2_message(m) for m in (data.get("messages") or []) if isinstance(m, dict)
+        )
+        if norm is not None
+    ]
+    info = dict(data.get("info") or {})
+    if not info.get("agent"):
+        counts: dict[str, int] = {}
+        for m in msgs:
+            agent = (m.get("info") or {}).get("agent")
+            if agent:
+                counts[agent] = counts.get(agent, 0) + 1
+        if counts:
+            info["agent"] = max(counts, key=counts.get)
+    msgs.sort(key=lambda m: ((m.get("info") or {}).get("time") or {}).get("created", 0))
+
+    # 2.x user 消息无 agent 字段(export 实测:user 顶层只有 files/id/text/time/type),
+    # 但 agent/root 切片按 ``info.agent`` 过滤 → 用户请求会被整段丢掉(切片只剩
+    # assistant、``digest.user_turns`` 为空 → 遵循性失判)。归属规则:**用户消息归
+    # 「下一条 assistant」的 agent** —— 会话内用户消息总是发给当时激活的 agent,
+    # 回应者即归属者(与 agent-switched 语义一致);尾部悬空(无后续 assistant)
+    # 保持无 agent,不属于任何段。1.x 透传消息自带 agent,``not agent`` 守卫不碰它。
+    next_agent: str | None = None
+    for m in reversed(msgs):
+        minfo = m.get("info") or {}
+        if minfo.get("role") == "assistant" and minfo.get("agent"):
+            next_agent = minfo["agent"]
+        elif minfo.get("role") == "user" and not minfo.get("agent") and next_agent:
+            minfo["agent"] = next_agent
+            m["info"] = minfo
+    return {"info": info, "messages": msgs}
+
+
+def _normalize_opencode_v2_message(m: dict) -> dict | None:
+    """2.x export 单条消息 → 1.x 形状(``{info: {role, agent, time}, parts}``)。
+
+    - 1.x 形状(带 ``info``)原样透传,幂等;``idle``(2.x 新增的会话状态消息,无内容)
+      及未知类型丢弃(1.x 无对应物,下游只认 user/assistant)。
+    - user:顶层 ``text`` → parts 里一条 text part(``files`` 附件 1.x 解析器本就不读,不映射)。
+    - assistant:``content`` 里的 text/tool part 映射;``reasoning`` 丢弃(1.x 解析器对
+      思考类 part 同样本就不读);tool part 名 ``name`` → 1.x 的 ``tool``、输出
+      ``state.content[].text`` → 1.x 的 ``state.output`` 字符串(多段按 ``\\n`` 连)。
+    """
+    if "info" in m:
+        return m
+    typ = m.get("type")
+    if typ == "user":
+        text = m.get("text") or ""
+        # opencode 2.x 实测怪癖:user text 被双重 JSON 编码 —— 字段值是 ``json.dumps``
+        # 后的原文(整个值就是一个 JSON 字符串字面量,首尾带 ")。audit 靠 user_turns
+        # 匹配任务指令,多一层引号会全数失配 → 用 json.loads 剥回原文。原文本身首尾
+        # 带引号时,其引号在编码里会被转义(如原文 '"x"' → 字段 '"\"x\""'),json.loads
+        # 恰好还原、不会误剥;非 JSON 字符串的裸文本 json.loads 抛错 → 原样保留。
+        if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+            try:
+                decoded = json.loads(text)
+                if isinstance(decoded, str):
+                    text = decoded
+            except json.JSONDecodeError:
+                pass
+        parts = [{"type": "text", "text": text}] if text else []
+        return {"info": {"role": "user", "time": m.get("time") or {}}, "parts": parts}
+    if typ == "assistant":
+        parts: list[dict] = []
+        for c in m.get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            ctype = c.get("type")
+            if ctype == "text":
+                if c.get("text"):
+                    parts.append({"type": "text", "text": c["text"]})
+            elif ctype == "tool":
+                state = c.get("state") or {}
+                output = "\n".join(
+                    p.get("text", "")
+                    for p in (state.get("content") or [])
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+                parts.append(
+                    {
+                        "type": "tool",
+                        "tool": c.get("name") or "",
+                        "state": {"input": state.get("input") or {}, "output": output},
+                    }
+                )
+        return {
+            "info": {"role": "assistant", "agent": m.get("agent"), "time": m.get("time") or {}},
+            "parts": parts,
+        }
+    return None
 
 
 def build_digest_from_opencode(path: Path, root: str | None = None, *, locate_turns: bool = False) -> SessionDigest:

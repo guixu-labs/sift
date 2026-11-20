@@ -82,7 +82,9 @@ class TestComparatorCallHttp:
         fake, cap = self._fake('{"winner":"A","reasoning":"t"}')
         with patch("sift.scoring.client.call_llm_with_retry", side_effect=fake):
             BlindComparator().client.complete("prompt")
-        assert cap[0]["transport"] == "http"
+        # site default http 已下沉到 call_llm_with_retry 内部(resolve_llm_transport,
+        # SIFT_LLM_TRANSPORT 可覆盖)——调用方不再显式传参,锁「无显式 transport」。
+        assert cap[0].get("transport") is None
         assert cap[0]["schema"] is COMPARATOR_SCHEMA
 
     def test_call_forwards_on_usage(self):

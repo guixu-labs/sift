@@ -69,7 +69,9 @@ class TestGraderCallHttp:
         fake, cap = self._fake(self._EMPTY)
         with patch("sift.scoring.client.call_llm_with_retry", side_effect=fake):
             LLMGrader().client.complete("prompt", schema=GRADING_SCHEMA)
-        assert cap[0]["transport"] == "http"
+        # site default http 已下沉到 call_llm_with_retry 内部(resolve_llm_transport,
+        # SIFT_LLM_TRANSPORT 可覆盖)——调用方不再显式传参,锁「无显式 transport」。
+        assert cap[0].get("transport") is None
         assert cap[0]["schema"] is GRADING_SCHEMA
 
     def test_grade_passes_grading_schema(self, tmp_path):

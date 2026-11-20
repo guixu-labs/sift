@@ -13,7 +13,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from sift.llm_transport import HttpRateLimited, LLMCallConfig
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, resolve_llm_transport
 from sift.models.critique_report import ContentQualityReport, CritiqueDimension
 from sift.parser import parse_skill_md
 from sift.utils import call_claude
@@ -359,7 +359,13 @@ def _critique_call(prompt: str, model: str | None, timeout: int) -> tuple[str | 
             response = call_claude(
                 prompt=prompt,
                 on_usage=usage.update,
-                config=LLMCallConfig(model=model, timeout=timeout, transport="http"),
+                config=LLMCallConfig(
+                    model=model,
+                    timeout=timeout,
+                    # site default http(单字符串 result schema、重试链兜 HttpRateLimited),
+                    # SIFT_LLM_TRANSPORT 可全局覆盖。
+                    transport=resolve_llm_transport(None, default="http"),
+                ),
             )
         except (HttpRateLimited, RuntimeError):
             response = None

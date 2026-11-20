@@ -65,6 +65,21 @@ class TestRetryExhaustedCause:
         r = self._judge(monkeypatch, self._raise(RuntimeError("claude CLI down")))
         assert isinstance(r, _RetryExhaustedType) and r.cause == "unknown"
 
+    def test_transport_unavailable_cause_no_retry(self, monkeypatch):
+        """静态缺位(CLI 不在 PATH)是永久错误:单次即耗尽、cause typed,不烧重试预算
+        (普通 RuntimeError 会重试 _LLM_RETRY_MAX 次,这里必须只调一次)。"""
+        from sift.llm_transport import TransportUnavailable
+
+        calls = []
+
+        def fake(*a, **k):
+            calls.append(1)
+            raise TransportUnavailable("claude CLI 未找到")
+
+        r = self._judge(monkeypatch, fake)
+        assert isinstance(r, _RetryExhaustedType) and r.cause == "transport_unavailable"
+        assert calls == [1]
+
     def test_parse_failed_cause(self, monkeypatch):
         # call 成功但 parse 全 None(LLM 返畸形)→ 0-解析重试耗尽
         r = self._judge(monkeypatch, lambda *a, **k: "not json at all")

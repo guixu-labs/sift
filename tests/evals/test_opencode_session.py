@@ -572,3 +572,161 @@ def _tool_session(parts):
             {"info": {"role": "assistant"}, "parts": parts},
         ],
     }
+
+
+# ---- opencode 2.x export 形状垫片(load_opencode_session 单点归一) ----
+
+
+def _v2_export() -> dict:
+    """opencode 2.0.24 实测形状(2026-11-19 spike):消息顶层 type/text/content,
+    tool part 名在 name、输出在 state.content[].text、无 session 级 agent、含 idle。"""
+    return {
+        "info": {
+            "id": "ses_v2",
+            "projectID": "p1",
+            "model": {"id": "glm-5.3", "providerID": "gateway", "variant": "default"},
+            "outcome": "succeeded",
+            "time": {"created": 1, "updated": 2},
+            "location": {"directory": "/ws"},
+        },
+        "messages": [
+            {
+                "id": "m1",
+                "time": {"created": 10},
+                "type": "user",
+                # 2.x 实测怪癖:user text 双重 JSON 编码(首尾带 ")
+                "text": '"read app.log and report"',
+                "files": [],
+            },
+            {
+                "id": "m2",
+                "time": {"created": 20},
+                "type": "assistant",
+                "agent": "log-error-analyzer",
+                "model": {"id": "glm-5.3", "providerID": "gateway"},
+                "finish": "tool-calls",
+                "content": [
+                    {"type": "reasoning", "text": "先读文件"},
+                    {
+                        "type": "tool",
+                        "id": "call_x1",
+                        "name": "read",
+                        "executed": False,
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "/ws/logs/app.log"},
+                            "content": [
+                                {"type": "text", "text": "Read file /ws/logs/app.log, lines 1-1\n1: E-AUTH-001 token expired"}
+                            ],
+                            "metadata": {"truncated": False},
+                        },
+                        "time": {"created": 20, "ran": 21, "completed": 22},
+                    },
+                ],
+            },
+            {
+                "id": "m3",
+                "time": {"created": 30},
+                "type": "assistant",
+                "agent": "log-error-analyzer",
+                "finish": "stop",
+                "content": [{"type": "text", "text": "发现 E-FAKE-999(编造)"}],
+            },
+            {"id": "m4", "time": {"created": 40}, "type": "idle", "outcome": "succeeded"},
+        ],
+    }
+
+
+def _write_v2(tmp_path: Path) -> Path:
+    p = tmp_path / "v2-session.json"
+    p.write_text(json.dumps(_v2_export(), ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_load_normalizes_v2_shape_and_drops_idle(tmp_path):
+    sess = load_opencode_session(_write_v2(tmp_path))
+    # idle 丢弃;roles 从顶层 type 归一;主 agent 由 assistant 众数推导
+    assert [m["info"]["role"] for m in sess["messages"]] == ["user", "assistant", "assistant"]
+    assert all(m["info"]["role"] != "idle" for m in sess["messages"])
+    assert sess["info"]["agent"] == "log-error-analyzer"
+    # user 文本 → parts;tool part 名(name→tool)、输出(state.content→state.output)
+    user_parts = sess["messages"][0]["parts"]
+    assert user_parts[0]["text"] == "read app.log and report"
+    tool_part = sess["messages"][1]["parts"][0]
+    assert tool_part["type"] == "tool" and tool_part["tool"] == "read"
+    assert tool_part["state"]["input"] == {"path": "/ws/logs/app.log"}
+    assert tool_part["state"]["output"] == "Read file /ws/logs/app.log, lines 1-1\n1: E-AUTH-001 token expired"
+    # reasoning part 不进 parts(1.x 解析器本就不读思考类)
+    assert [p["type"] for p in sess["messages"][1]["parts"]] == ["tool"]
+
+
+def test_load_v2_user_message_gets_next_assistant_agent(tmp_path):
+    """评审复现:2.x user 消息无 agent 字段(export 实测),按 agent/root 切片只保留
+    info.agent 匹配的消息 → 用户请求被整段丢掉、digest.user_turns 空。归属规则:
+    用户消息归「下一条 assistant」的 agent(回应者即归属者)。"""
+    sess = load_opencode_session(_write_v2(tmp_path))
+    user = sess["messages"][0]
+    assert user["info"]["role"] == "user"
+    assert user["info"]["agent"] == "log-error-analyzer", "user 须归到下一条 assistant 的 agent"
+
+
+def test_slice_v2_user_request_not_dropped_from_agent_slice(tmp_path):
+    """评审原始复现闭环:「用户请求 + 目标 agent 回复」→ 切片必须同时保留 user 与
+    assistant(修复前切片只剩 assistant,digest.user_turns 为空 → 遵循性失判)。"""
+    from sift.evals.opencode import slice_opencode_by_agent
+
+    segments = slice_opencode_by_agent(_write_v2(tmp_path), "log-error-analyzer")
+    assert len(segments) == 1
+    roles = [m["info"]["role"] for m in segments[0]["messages"]]
+    assert roles == ["user", "assistant", "assistant"], "用户请求必须留在 agent 切片里"
+    # 切片重建 digest:user_turns 非空(修复前为空)
+    seg_path = tmp_path / "seg.json"
+    seg_path.write_text(json.dumps(segments[0], ensure_ascii=False), encoding="utf-8")
+    d = build_digest_from_opencode(seg_path)
+    assert d.user_turns == ["read app.log and report"]
+
+
+def test_load_v2_trailing_user_without_assistant_has_no_agent(tmp_path):
+    """尾部悬空 user(无后续 assistant)→ 保持无 agent,不属于任何段(不硬造归属)。"""
+    sess = _v2_export()
+    sess["messages"].append(
+        {"id": "m5", "time": {"created": 50}, "type": "user", "text": '"orphan"', "files": []}
+    )
+    p = tmp_path / "trailing-user.json"
+    p.write_text(json.dumps(sess, ensure_ascii=False), encoding="utf-8")
+    loaded = load_opencode_session(p)
+    trailing = loaded["messages"][-1]
+    assert trailing["info"]["role"] == "user"
+    assert not trailing["info"].get("agent")
+
+
+def test_build_digest_from_v2_export(tmp_path):
+    d = build_digest_from_opencode(_write_v2(tmp_path))
+    assert d.skill_used == "log-error-analyzer"  # 众数 agent → skill_used
+    assert d.user_turns == ["read app.log and report"]
+    assert any(tc.name.lower() == "read" for tc in d.tool_trace)
+    # Read 输出进 input_files(共享重建器清洗:去行号前缀)
+    assert d.input_files and d.input_files[0].path.endswith("app.log")
+    assert "E-AUTH-001" in d.input_files[0].content
+    assert "1: E-AUTH-001" not in d.input_files[0].content  # 行号前缀已清
+    # assistant 文本进 transcript_text
+    assert "E-FAKE-999" in d.transcript_text
+
+
+def test_load_v2_quoted_user_text_preserved(tmp_path):
+    """原文首尾带引号(任务指令本身是引号串)时,剥一层双重编码后引号保留、不误剥。"""
+    sess = _v2_export()
+    raw = '"verify the fix"'  # 任务指令原文本身首尾带引号
+    sess["messages"][0]["text"] = json.dumps(raw)  # opencode 2.x 双重编码(json.dumps 后的原文)
+    p = tmp_path / "quoted-session.json"
+    p.write_text(json.dumps(sess, ensure_ascii=False), encoding="utf-8")
+    loaded = load_opencode_session(p)
+    assert loaded["messages"][0]["parts"][0]["text"] == '"verify the fix"'  # 引号保留
+
+
+def test_load_v1_shape_passthrough_untouched():
+    """1.x 形状原样透传(幂等):既有 fixture 不经垫片改动。"""
+    sess = load_opencode_session(_LEA_OC)
+    assert sess["info"]["agent"] == "log-error-analyzer"  # 原生 info.agent,非推导
+    for m in sess["messages"]:
+        assert "type" not in m  # 未被改写

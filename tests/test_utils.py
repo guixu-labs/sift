@@ -27,6 +27,40 @@ def _prepend_path(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
+@pytest.fixture
+def cc_popen_stub(monkeypatch, tmp_path):
+    """cc transport 协议单测地基:真 which 门放行 + mock Popen 捕获。
+
+    与行为层(_make_fake_claude 真跑假 CLI)互补,本夹具只验 wire 协议构造——
+    参数/env/进程组,不验 CLI 行为。两层分工:
+
+    - 存在性门:占位 claude 铺上 tmp_path 前置 PATH,call_cli 的前置检查走真
+      shutil.which(门逻辑被真实覆盖,而非绕过);占位体 exit 0,正常情况下
+      永不真正执行——Popen 已被换装;
+    - 协议捕获:subprocess.Popen 换装 MagicMock,communicate 返回值按测试装填
+      (text/json/schema 三模式输出形态)。
+
+    没有 CLI 的环境(GitHub runner)与装了 CLI 的环境(本机)行为一致。
+    """
+    _make_fake_claude(tmp_path, "exit 0")
+    _prepend_path(monkeypatch, tmp_path)
+
+    def _install(stdout="out"):
+        from unittest.mock import MagicMock
+
+        import sift.llm_transport as u
+
+        proc = MagicMock()
+        proc.communicate.return_value = (stdout, "")
+        proc.returncode = 0
+        proc.pid = 99999
+        popen = MagicMock(return_value=proc)
+        monkeypatch.setattr(u.subprocess, "Popen", popen)
+        return popen
+
+    return _install
+
+
 def test_call_claude_timeout_raises_within_window(monkeypatch, tmp_path):
     # 基本功能:超时抛 RuntimeError 且不长时间卡住。注意——WSL2 上假进程被
     # SIGKILL 即清理(~2s),无法用假进程复现真 claude 子进程树卡死(曾卡 2588s);
@@ -40,21 +74,12 @@ def test_call_claude_timeout_raises_within_window(monkeypatch, tmp_path):
     assert elapsed < 5, f"超时后未及时返回:耗时 {elapsed:.1f}s"
 
 
-def test_call_claude_runs_backend_in_new_process_group(monkeypatch, tmp_path):
+def test_call_claude_runs_backend_in_new_process_group(cc_popen_stub):
     # 契约:外部 CLI 必须在独立进程组(start_new_session),超时方可 killpg 杀整组。
     # killpg 价值无法行为复现(见上),只能断言此契约在位,防重构丢失。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
-    proc = MagicMock()
-    proc.communicate.return_value = ("out", "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub()
     call_claude(prompt="x", config=LLMCallConfig(timeout=10))
-    _, kwargs = mock_popen.call_args
+    _, kwargs = popen.call_args
     assert kwargs.get("start_new_session") is True
 
 
@@ -71,47 +96,29 @@ def test_call_claude_nonzero_exit_raises(monkeypatch, tmp_path):
         call_claude(prompt="x", config=LLMCallConfig(timeout=10))
 
 
-def test_call_claude_injects_claude_code_identity_when_absent(monkeypatch):
+def test_call_claude_injects_claude_code_identity_when_absent(cc_popen_stub, monkeypatch):
     # 智谱(open.bigmodel.cn)后端在模型过载时只放行带 claude-code 身份标识
     # (AI_AGENT + CLAUDE_CODE_ENTRYPOINT)的请求,裸 claude CLI 被直接 529 挡回。
     # 这俩变量由 VSCode 扩展/SDK 注入、用户终端默认没有 → 终端跑 audit 会系统性失败
     # (实测:同 token 同时刻,带这俩 OK、不带 529/超时)。故 call_claude 必须在子进程
     # env 缺这俩时补上。值版本无关(通用 'claude-code' 实测即放行)。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
     monkeypatch.delenv("AI_AGENT", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
-    proc = MagicMock()
-    proc.communicate.return_value = ("out", "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub()
     call_claude(prompt="x", config=LLMCallConfig(timeout=10))
-    _, kwargs = mock_popen.call_args
+    _, kwargs = popen.call_args
     env = kwargs["env"]
     assert env.get("AI_AGENT") == "claude-code"
     assert env.get("CLAUDE_CODE_ENTRYPOINT") == "claude-vscode"
 
 
-def test_call_claude_preserves_existing_identity(monkeypatch):
+def test_call_claude_preserves_existing_identity(cc_popen_stub, monkeypatch):
     # 在 claude-code 上下文内跑(VSCode 扩展/SDK 已注入真值)时,不覆盖、保留原值。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
     monkeypatch.setenv("AI_AGENT", "real-agent-xyz")
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "real-entrypoint")
-    proc = MagicMock()
-    proc.communicate.return_value = ("out", "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub()
     call_claude(prompt="x", config=LLMCallConfig(timeout=10))
-    _, kwargs = mock_popen.call_args
+    _, kwargs = popen.call_args
     env = kwargs["env"]
     assert env.get("AI_AGENT") == "real-agent-xyz"
     assert env.get("CLAUDE_CODE_ENTRYPOINT") == "real-entrypoint"
@@ -163,37 +170,19 @@ def test_call_claude_with_usage_invokes_callback_and_returns_result(monkeypatch,
     assert snap["calls"] == 1
 
 
-def test_call_claude_without_on_usage_uses_text_format(monkeypatch):
+def test_call_claude_without_on_usage_uses_text_format(cc_popen_stub):
     # 默认 on_usage=None → text 模式(历史行为,字节不变)。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
-    proc = MagicMock()
-    proc.communicate.return_value = ("out", "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub()
     call_claude(prompt="x", config=LLMCallConfig(timeout=10))
-    cmd = mock_popen.call_args.args[0]
+    cmd = popen.call_args.args[0]
     assert cmd[cmd.index("--output-format") + 1] == "text"
 
 
-def test_call_claude_with_on_usage_uses_json_format(monkeypatch):
+def test_call_claude_with_on_usage_uses_json_format(cc_popen_stub):
     # 给 on_usage → json 模式。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
-    proc = MagicMock()
-    proc.communicate.return_value = ('{"result":"x","usage":{}}', "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub('{"result":"x","usage":{}}')
     call_claude(prompt="x", on_usage=lambda d: None, config=LLMCallConfig(timeout=10))
-    cmd = mock_popen.call_args.args[0]
+    cmd = popen.call_args.args[0]
     assert cmd[cmd.index("--output-format") + 1] == "json"
 
 
@@ -218,21 +207,12 @@ def test_call_claude_usage_missing_skips_callback(monkeypatch, tmp_path):
 
 
 # ── schema 模式:--json-schema 结构化输出 ─────────────────────────────────────
-def test_call_claude_schema_adds_json_schema_flag_and_json_format(monkeypatch):
+def test_call_claude_schema_adds_json_schema_flag_and_json_format(cc_popen_stub):
     # schema 给定 → cmd 带 --json-schema(后跟 schema json)且强制 json 模式。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
-    proc = MagicMock()
-    proc.communicate.return_value = ('{"structured_output":{"items":[]},"usage":{}}', "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub('{"structured_output":{"items":[]},"usage":{}}')
     sch = {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}
     call_claude(prompt="x", config=LLMCallConfig(timeout=10, schema=sch))
-    cmd = mock_popen.call_args.args[0]
+    cmd = popen.call_args.args[0]
     assert cmd[cmd.index("--output-format") + 1] == "json"  # schema 强制 json
     assert "--json-schema" in cmd
     assert json.loads(cmd[cmd.index("--json-schema") + 1]) == sch
@@ -283,22 +263,13 @@ def test_call_claude_schema_without_on_usage_still_returns_structured(monkeypatc
     assert json.loads(out) == [{"index": 1, "applicable": False}]
 
 
-def test_call_claude_schema_raises_max_turns_floor(monkeypatch):
+def test_call_claude_schema_raises_max_turns_floor(cc_popen_stub):
     # 结构化输出需 claude 走 tool_use(实测 num_turns=2);判官常设 max_turns=1 会
     # 截断成 error_max_turns(整批 RuntimeError)。schema 模式保底 max_turns≥2。
-    from unittest.mock import MagicMock
-
-    import sift.llm_transport as u
-
-    proc = MagicMock()
-    proc.communicate.return_value = ('{"structured_output":{"items":[]},"usage":{}}', "")
-    proc.returncode = 0
-    proc.pid = 99999
-    mock_popen = MagicMock(return_value=proc)
-    monkeypatch.setattr(u.subprocess, "Popen", mock_popen)
+    popen = cc_popen_stub('{"structured_output":{"items":[]},"usage":{}}')
     sch = {"type": "object", "properties": {"items": {"type": "array"}}, "required": ["items"]}
     call_claude(prompt="x", config=LLMCallConfig(timeout=10, max_turns=1, schema=sch))
-    cmd = mock_popen.call_args.args[0]
+    cmd = popen.call_args.args[0]
     assert cmd[cmd.index("--max-turns") + 1] == "2"  # 保底 2(原 max_turns=1)
 
 
@@ -1131,9 +1102,22 @@ def test_token_accumulator_ignores_truncated_field():
 # ── call_claude transport 调度:cc(默认)/ http(529→cc 兜底)──
 
 
+def _pin_which(monkeypatch, present):
+    """写死 which 探测(调度测试环境无关):present 里的名字视为已装,其余缺位。
+
+    桥接层让 resolve/回退支线探测 CLI 在不在——不写死的话这些调度测试的结果随
+    本机装了什么 CLI 而抖(只装 opencode 的机器上 cc 会被兜底转走、CI 上俩都缺
+    又测不到转接)。调度语义归调度测试,缺位转接归 test_opencode_llm_transport。
+    """
+    import sift.llm_transport as u
+
+    monkeypatch.setattr(u.shutil, "which", lambda name: f"/fake/{name}" if name in present else None)
+
+
 def test_resolve_llm_transport_precedence(monkeypatch):
     import sift.llm_transport as u
 
+    _pin_which(monkeypatch, {"claude", "opencode"})  # 双引擎在位:纯优先级语义,兜底转接不介入
     monkeypatch.setenv("SIFT_LLM_TRANSPORT", "http")
     assert u.resolve_llm_transport(None) == "http"
     assert u.resolve_llm_transport("cc") == "cc"
@@ -1143,6 +1127,7 @@ def test_resolve_llm_transport_precedence(monkeypatch):
 def test_resolve_llm_transport_defaults_and_rejects_unknown(monkeypatch):
     import sift.llm_transport as u
 
+    _pin_which(monkeypatch, {"claude"})  # claude 在位:默认 cc 成立(缺位会被兜底转 opencode)
     monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
     assert u.resolve_llm_transport(None) == "cc"
     monkeypatch.setenv("SIFT_LLM_TRANSPORT", "wat")
@@ -1154,6 +1139,7 @@ def test_call_claude_default_transport_is_cc(monkeypatch):
     """不传 transport 且未设 env → 默认 cc → call_http 绝不被调。"""
     import sift.llm_transport as u
 
+    _pin_which(monkeypatch, {"claude"})  # 调度测试不测环境:claude 在位,兜底转接不介入
     monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
     monkeypatch.setattr(u, "call_cli", lambda *a, **k: "cc-out")
     monkeypatch.setattr(
@@ -1181,6 +1167,7 @@ def test_call_claude_http_529_falls_back_to_cc(monkeypatch):
     """transport='http' 撞 HttpThrottled → 回退 call_cli(=今天速度,最坏不更差)。"""
     import sift.llm_transport as u
 
+    _pin_which(monkeypatch, {"claude"})  # 回退落点 cc 在位(缺位会被兜底转 opencode)
     calls = {"http": 0, "cc": 0}
 
     def fake_http(*a, **k):
@@ -1220,6 +1207,7 @@ def test_call_claude_http_no_tool_use_falls_back_to_cc(monkeypatch):
     """
     import sift.llm_transport as u
 
+    _pin_which(monkeypatch, {"claude"})  # 回退落点 cc 在位(缺位会被兜底转 opencode)
     calls = {"http": 0, "cc": 0}
 
     def fake_http(*a, **k):

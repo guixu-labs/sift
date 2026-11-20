@@ -84,7 +84,9 @@ class TestBuildLlmSuggestionHttp:
         fake, cap = self._fake(json.dumps({"suggestion": "x"}))
         with patch("sift.execution.trigger_suggest.call_llm_with_retry", side_effect=fake):
             build_llm_suggestion("desc", _FAILED, [])
-        assert cap[0]["transport"] == "http"
+        # site default http 已下沉到 call_llm_with_retry 内部(resolve_llm_transport,
+        # SIFT_LLM_TRANSPORT 可覆盖)——调用方不再显式传参,锁「无显式 transport」。
+        assert cap[0].get("transport") is None
         assert cap[0]["schema"] is _SUGGEST_SCHEMA
 
     def test_degrades_on_empty_response(self):

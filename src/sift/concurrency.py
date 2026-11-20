@@ -16,7 +16,7 @@ import random
 import threading
 import time
 
-from sift.llm_transport import HttpRateLimited, LLMCallConfig
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, TransportUnavailable, resolve_llm_transport
 from sift.utils import call_claude
 
 
@@ -224,7 +224,7 @@ def call_llm_with_retry(
     timeout: int = 120,
     schema: dict | None = None,
     on_usage=None,
-    transport: str = "http",
+    transport: str | None = None,
     on_progress=None,
     max_retries: int = _LLM_WRAPPER_RETRY_MAX,
     max_tokens: int | None = None,
@@ -237,9 +237,11 @@ def call_llm_with_retry(
 
     结构严格镜像 audit ``judge_batch_with_retry``:``with LLM_LIMITER:`` 只圈 ``call_claude``
     (重试退避不占槽);**成功赋值不早返**(早返会跳过 with 外的 ``on_success`` → AIMD 永不加性增
-    → 静默劣化),``on_success``/``on_throttled``/sleep 都在 with 外。默认 ``transport="http"``
-    (forced tool_use、schema-safe)。
+    → 静默劣化),``on_success``/``on_throttled``/sleep 都在 with 外。site default ``http``
+    (forced tool_use、schema-safe),``transport=None`` 时经 ``resolve_llm_transport`` 让
+    ``SIFT_LLM_TRANSPORT`` 全局覆盖(opencode/dsh 等)。
     """
+    resolved_transport = resolve_llm_transport(transport, default="http")
     for attempt in range(max_retries + 1):
         if attempt > 0:
             time.sleep(_LLM_WRAPPER_RETRY_DELAY * attempt)
@@ -251,7 +253,11 @@ def call_llm_with_retry(
                     on_usage=on_usage,
                     on_progress=on_progress,
                     config=LLMCallConfig(
-                        model=model, timeout=timeout, schema=schema, transport=transport, max_tokens=max_tokens
+                        model=model,
+                        timeout=timeout,
+                        schema=schema,
+                        transport=resolved_transport,
+                        max_tokens=max_tokens,
                     ),
                 )
         except HttpRateLimited as exc:
@@ -264,6 +270,12 @@ def call_llm_with_retry(
             )
             time.sleep(_LLM_WRAPPER_BACKOFF * (2**attempt) + random.uniform(0, 1))
             continue
+        except TransportUnavailable as exc:
+            # 静态缺位(二进制不在 PATH)是永久错误:不退避不重试,立即以耗尽形态上抛
+            # —— 调用方的 except LLMRetryExhausted 降级路径(grader→UNEVAL 等)不变,
+            # 消息保留原报错,人能看清是环境问题不是瞬态抖动。
+            _emit(on_progress, f"  LLM 调用失败(transport 不可用,不重试): {str(exc)[:120]}")
+            raise LLMRetryExhausted(str(exc)) from exc
         except RuntimeError as exc:
             _emit(on_progress, f"  LLM 调用失败: {str(exc)[:120]}")
             continue

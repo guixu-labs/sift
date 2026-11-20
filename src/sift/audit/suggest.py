@@ -261,7 +261,6 @@ class _SuggestionBatchRunner:
                 timeout=self.timeout,
                 schema=_WIRE_SCHEMA,
                 on_usage=self._on_usage,
-                transport="http",
                 on_progress=prog,  # http 升档/cc 回退进度行(单发最长 600s,静默像死机)
                 max_tokens=mt,
             )

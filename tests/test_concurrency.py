@@ -380,6 +380,24 @@ def test_call_llm_with_retry_exhaustion_raises(monkeypatch):
         cc.call_llm_with_retry("p", max_retries=1)
 
 
+def test_call_llm_with_retry_transport_unavailable_fast_fails(monkeypatch):
+    """静态缺位(二进制不在 PATH)不重试:单次调用即以 LLMRetryExhausted 上抛,
+    消息保留原报错(调用方的 except LLMRetryExhausted 降级路径不变)。"""
+    from sift.llm_transport import TransportUnavailable
+
+    cc = _reset_limiter_and_time(monkeypatch)
+    calls = []
+
+    def fake(*a, **k):
+        calls.append(1)
+        raise TransportUnavailable("claude CLI 未找到")
+
+    monkeypatch.setattr(cc, "call_claude", fake)
+    with pytest.raises(cc.LLMRetryExhausted, match="claude CLI 未找到"):
+        cc.call_llm_with_retry("p", max_retries=3)
+    assert calls == [1]  # 不重试(RuntimeError 会重试满 max_retries)
+
+
 def test_call_llm_with_retry_runtime_error_retried(monkeypatch):
     cc = _reset_limiter_and_time(monkeypatch)
     seq = [RuntimeError("boom"), "ok"]

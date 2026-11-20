@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import urllib.error
@@ -21,7 +22,9 @@ class LLMCallConfig(NamedTuple):
     timeout: int = 120
     schema: dict | None = None
     max_turns: int | None = None
-    # None = 跟随 SIFT_LLM_TRANSPORT；未设置时保持 cc。
+    # None = 跟随 SIFT_LLM_TRANSPORT(resolve_llm_transport 单点:显式 > env > 调用点 default);
+    # 未设置时保持 cc。判官批的 site default(cc / http 优选批)在 options 层经
+    # transport_default 表达,见 BatchJudgeOptions / call_llm_with_retry。
     transport: str | None = None
     max_tokens: int | None = None
 
@@ -58,6 +61,20 @@ class HttpNoToolUse(Exception):
     def __init__(self, message="", stop_reason=None):
         super().__init__(message)
         self.stop_reason = stop_reason
+
+
+class TransportUnavailable(RuntimeError):
+    """transport 的 CLI 二进制静态缺位(不在 PATH)——永久性环境错误,**不重试**。
+
+    与「运行时坏」(凭据过期/网络断/后端 529,瞬态或须人工介入的 RuntimeError)分开:
+    二进制不在 PATH 重试一万次也不会出现,重试只烧退避时间。两个重试壳
+    (``judge_batch_with_retry`` / ``call_llm_with_retry``)对该类型**立即失败**。
+
+    保持 RuntimeError 基类:所有外层 ``except RuntimeError`` 的降级路径(批级 UNRESOLVED
+    兜底、critique/headline 的跳过)零改动接住;cc 缺位时 resolve 层已先按兜底表转
+    opencode(见 ``_TRANSPORT_FALLBACKS``),走到这里说明兜底也不可用/或显式指定的引擎
+    缺失 —— 报错即配置事实,不该被掩盖。
+    """
 
 
 # 裸 HTTP forced tool_use 的输出上限。4096(协议级保守默认,所有 Anthropic 兼容端点都接受;
@@ -155,15 +172,87 @@ def resolve_http_model(model: str | None) -> str:
     return model[:i] if i != -1 else model
 
 
-def resolve_llm_transport(configured: str | None) -> str:
-    """显式 transport 优先；否则读取 SIFT_LLM_TRANSPORT，最终回退 cc。"""
-    transport = (configured or os.environ.get("SIFT_LLM_TRANSPORT") or "cc").strip().lower()
-    if transport not in {"cc", "http", "dsh"}:
+# ---------------------------------------------------------------------------
+# transport 静态缺位兜底(桥接层)
+#
+# 「没装」是确定性环境事实,机器可自动兜底并大声说;「装了但运行时坏」(凭据/网络/
+# 529)是不确定运行事件,机器只报清楚、把选择权交还给人 —— 两类故障一刀切开是本层
+# 的地基,决定:只对静态缺位转接、转必可见、批内一致(表驱动 + resolve 单点,判官批
+# 一次 resolve 整批复用,天然粘性)。
+# ---------------------------------------------------------------------------
+
+# 各 transport 的 CLI 二进制名。http 无 CLI(直连,永不缺位);dsh 的二进制名可经
+# SIFT_DSH_BIN 改、属执行器域(dsh_runner 自查,raise DshRunnerError 非重试型,同语义)。
+_TRANSPORT_CLI_NAMES: dict[str, str] = {"cc": "claude", "opencode": "opencode"}
+
+# 兜底表:**单向** —— 只有 cc 是源。显式选 opencode/dsh 的人要的是那个引擎的模型语义,
+# 缺了就如实报错(静默换源 = 破坏判官批一致性 + 掩盖配置错误);反向(opencode→cc)不设。
+# 表结构让加方向只是加一行,探测顺序即表序。
+_TRANSPORT_FALLBACKS: dict[str, tuple[str, ...]] = {"cc": ("opencode",)}
+
+
+def _transport_fallback_for(transport: str) -> str:
+    """resolved transport 的 CLI 静态缺位 → 按表找首个可用替代;无替代维持原值。
+
+    纯探测、无副作用(可见提示由调用方发)。非兜底源(http / dsh / opencode / 显式引擎)
+    **不碰文件系统**直接原样返回 —— 行为不随环境抖动。每次现查不缓存:``which`` 一次
+    PATH 扫描 0.1ms 级,对 40-600s 的判官调用可忽略,免缓存失效/测试擦除复杂度、永远新鲜。
+    """
+    alternatives = _TRANSPORT_FALLBACKS.get(transport)
+    if not alternatives or shutil.which(_TRANSPORT_CLI_NAMES[transport]) is not None:
+        return transport
+    for alt in alternatives:
+        if shutil.which(_TRANSPORT_CLI_NAMES[alt]) is not None:
+            return alt
+    return transport
+
+
+# 已播报过的转接:转接决策是确定性环境事实(CLI 缺位),同一条转接进程内只报一次 ——
+# resolve 会在判官多批 × 重试里被反复调用,重复告警是纯刷屏(一场几十批的 audit 会打出
+# 几十条一模一样的「cc 已转 opencode」)。报一次仍满足「兜底必可见」,刷屏反把真问题淹没。
+_announced_transport_fallbacks: set[tuple[str, str]] = set()
+
+
+def _announce_transport_fallback(from_transport: str, to_transport: str) -> None:
+    """兜底必可见:转接打一行 warning(logging 无 handler 时 lastResort 落 stderr,CLI 直达)。
+
+    同一条转接全程只播报一次(``_announced_transport_fallbacks`` 去重),避免多批重试刷屏。
+    """
+    key = (from_transport, to_transport)
+    if key in _announced_transport_fallbacks:
+        return
+    _announced_transport_fallbacks.add(key)
+    logging.warning(
+        "%s CLI 未找到,LLM 调用已转 %s transport(静态缺位兜底);要固定该引擎可显式设 SIFT_LLM_TRANSPORT=%s",
+        _TRANSPORT_CLI_NAMES[from_transport],
+        to_transport,
+        to_transport,
+    )
+
+
+def resolve_llm_transport(configured: str | None, default: str = "cc") -> str:
+    """transport 决策链单点:显式 ``configured`` > ``SIFT_LLM_TRANSPORT`` > ``default``。
+
+    调用点显式值(用户 --model 级 / 批判官的 site default)仍最高;``configured=None``
+    时环境变量可覆盖 site default —— ``SIFT_LLM_TRANSPORT=opencode`` 即全局一键换
+    判官引擎。site default 由调用点经 ``default`` 表达(http 优选的批传 ``"http"``,
+    主判官批不传用 ``"cc"``),无 env 时行为与历史逐字面一致。
+
+    **静态缺位兜底(桥接)**:resolved 为 cc 而 claude CLI 不在 PATH 时,按
+    ``_TRANSPORT_FALLBACKS`` 表转 opencode 并打一行可见提示 —— 兜底救的是「没装」
+    这种确定性环境事实;「装了但运行时坏」不在此列(那类走 TransportUnavailable /
+    RuntimeError,交给人处理)。判官批一次 resolve、整批复用 → 转接批内天然粘性。
+    """
+    transport = (configured or os.environ.get("SIFT_LLM_TRANSPORT") or default).strip().lower()
+    if transport not in {"cc", "http", "dsh", "opencode"}:
         raise RuntimeError(
-            f"未知 LLM transport: {transport!r}；只支持 cc / http / dsh"
+            f"未知 LLM transport: {transport!r}；只支持 cc / http / dsh / opencode"
             "（可通过 SIFT_LLM_TRANSPORT 设置）"
         )
-    return transport
+    resolved = _transport_fallback_for(transport)
+    if resolved != transport:
+        _announce_transport_fallback(transport, resolved)
+    return resolved
 
 
 def _strip_code_fence(text: str) -> str:
@@ -233,6 +322,74 @@ def call_dsh(
         jsonschema.validate(parsed, schema)
     except jsonschema.ValidationError as exc:
         raise RuntimeError(f"dsh LLM transport returned schema-invalid JSON: {exc.message}") from exc
+    # array 判官解包(与 call_cli/call_http/call_opencode 同约:判官把顶层 array 包成
+    # {"items":[...]} 交协议,transport 透明解开、下游 parser 零改动)。
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return json.dumps(parsed["items"], ensure_ascii=False)
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def call_opencode(
+    prompt: str,
+    config: LLMCallConfig,
+    on_usage: Callable[[dict], None] | None,
+    on_progress: Callable[[str], None] | None = None,
+) -> str:
+    """经 ``opencode run --standalone`` 完成一次判官补全(prompt 内嵌 schema,与 dsh 同型)。
+
+    与 ``call_dsh`` 镜像的三段式:prompt 追加单轮/禁工具/schema 指令 →
+    ``execution/opencode_llm.complete`` 隔离 spawn → 剥 code fence + json.loads +
+    jsonschema 严格校验,失败 RuntimeError(走判官既有重试链)。**不回退 cc**(换判官
+    引擎而非快路径,静默回退会换模型破坏一致性)。schema=None 时纯文本进出
+    (init/add/coverage 文本模式)。模型语义 = opencode 语义:含 ``/`` 才传
+    ``-m provider/model``,裸名走 opencode config 默认模型。
+    """
+    from sift.execution.opencode_llm import complete
+
+    schema = config.schema
+    instructions = [
+        "This is a single-turn non-interactive generation request.",
+        "Do not call tools. Do not ask questions. Return the final answer directly.",
+    ]
+    if schema is not None:
+        instructions.extend(
+            [
+                "Return ONLY one JSON value that conforms to the following JSON Schema.",
+                "Do not wrap it in Markdown fences or add explanatory prose.",
+                json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+    full_prompt = f"{prompt}\n\n" + "\n".join(instructions)
+    _emit_progress(on_progress, "  ↳ opencode transport…")
+    result = complete(full_prompt, model=config.model, timeout=config.timeout)
+    if on_usage is not None and (result.input_tokens or result.output_tokens):
+        # 裸 API 不总给 cost(step_finish 的 cost 缺省 0),payload 形状对齐 call_claude。
+        on_usage(
+            {
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "total_cost_usd": result.cost_usd,
+            }
+        )
+    text = result.text.strip()
+    if not text:
+        raise RuntimeError("opencode transport returned empty final text")
+    if schema is None:
+        return text
+    candidate = _strip_code_fence(text)
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"opencode transport returned invalid JSON: {exc}") from exc
+    import jsonschema
+
+    try:
+        jsonschema.validate(parsed, schema)
+    except jsonschema.ValidationError as exc:
+        raise RuntimeError(f"opencode transport returned schema-invalid JSON: {exc.message}") from exc
+    # array 判官解包(与 call_cli/call_http 同约:{"items":[...]} → 裸 array)。
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return json.dumps(parsed["items"], ensure_ascii=False)
     return json.dumps(parsed, ensure_ascii=False)
 
 
@@ -438,12 +595,21 @@ def claude_cli_env() -> dict:
     return env
 
 
-def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
-    """跑 claude CLI 子进程、返 stdout 文本。超时 killpg、非零退出 raise。
+def spawn_cli(
+    cmd: list[str],
+    prompt: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> str:
+    """跑外部 CLI 子进程(claude / opencode 共用)、返 stdout 文本。超时 killpg、非零退出 raise。
 
     text / json 两条输出格式共用此底层(只管 spawn + 收 stdout,不关心格式)。
+    ``env`` 缺省 = ``claude_cli_env()``;``cwd`` 缺省 = 当前目录 —— opencode 判官
+    transport(``execution/opencode_llm``)传隔离 XDG env + 隔离 cwd(项目级
+    ``opencode.json`` 的 agent 定义在 cwd 里)。
     """
-    env = claude_cli_env()
+    env = claude_cli_env() if env is None else env
     # start_new_session 让外部 CLI(claude/opencode 等通用 backend)在独立进程组,
     # 超时方可 os.killpg 杀整组含其子进程树——这类 CLI 常是 wrapper + node worker,
     # 单 kill 主进程会让 worker 成孤儿、持有 stdout pipe 使 communicate 卡死
@@ -455,6 +621,7 @@ def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=cwd,
         start_new_session=True,
     )
     try:
@@ -465,13 +632,14 @@ def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
         except (ProcessLookupError, PermissionError):
             logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
         proc.wait()
-        raise RuntimeError(f"claude CLI timed out after {timeout}s") from _caught_error
+        raise RuntimeError(f"{cmd[0]} CLI timed out after {timeout}s") from _caught_error
     if proc.returncode != 0:
         # claude CLI 实测把输出/错误打 stdout、stderr 常空(后端不可用时 exit 1 +
         # stderr 空),只报 stderr 会得到冒号后空白的报错、根因被吞。两条都查才看得到;
-        # 优先 stderr(常规错误通道),空则 fallback stdout。
+        # 优先 stderr(常规错误通道),空则 fallback stdout(opencode 同款:错误以
+        # {"type":"error",...} 事件打 stdout、exit 1)。
         detail = err.strip() or out.strip()
-        raise RuntimeError(f"claude CLI failed (exit {proc.returncode}): {detail[:500]}")
+        raise RuntimeError(f"{cmd[0]} CLI failed (exit {proc.returncode}): {detail[:500]}")
     return out
 
 
@@ -480,6 +648,15 @@ def call_cli(prompt, config: LLMCallConfig, max_turns, on_usage):
 
     见 ``call_claude`` 的 docstring(text/json/schema 三模式 + array 解包 + 兜底语义)。
     """
+    if shutil.which("claude") is None:
+        # 前置存在性检查(与 opencode_llm.complete 对齐):缺失时报一次清楚 + 指路,
+        # 不裸抛 FileNotFoundError 进重试链空转。TransportUnavailable 在两个重试壳
+        # 里都是立即失败;resolve 层通常已先兜底转 opencode,走到这里是「兜底也不可用」
+        # (两 CLI 都缺)或显式指定了 cc —— 如实报配置事实。
+        raise TransportUnavailable(
+            "claude CLI 未找到;cc transport 需先装 claude 并确保在 PATH(https://claude.com)。"
+            "本机无 claude 时可设 SIFT_LLM_TRANSPORT=opencode 改走 opencode(模型随 opencode 配置走)"
+        )
     model = config.model
     timeout = config.timeout
     schema = config.schema
@@ -552,12 +729,17 @@ def call_claude(
     模型、超时、schema、轮次和传输设置由 ``config`` 提供；用量及进度回调独立传入。
 
     ``transport``(代码级):显式值优先；未指定时读 ``SIFT_LLM_TRANSPORT``，最终默认
-    ``"cc"``。``"cc"`` → cc CLI(``call_cli``);``"http"`` → 裸 HTTP 直连
+    ``"cc"``(决策链与**静态缺位兜底**见 ``resolve_llm_transport``:claude 不在 PATH
+    时自动转 opencode 并打提示;「装了但运行时坏」不自动换引擎,交
+    ``TransportUnavailable``/RuntimeError 如实报)。``"cc"`` → cc CLI(``call_cli``);``"http"`` → 裸 HTTP 直连
     (``call_http``,省 cc 进程 spawn + ~25k 系统 prompt/批,
     forced tool_use 保 schema)。裸 HTTP 撞 529(后端过载/身份限流)/ forced tool_use 拿不到
     tool_use 块(GLM 只回 thinking / thinking 撑满 ``HTTP_MAX_TOKENS`` → ``HttpNoToolUse``)
     → 回退 cc(cc 多轮催出 + 降级文本兜底);其余 HTTP 错(4xx/timeout→RuntimeError)不回退
-    (同 endpoint 无意义)。
+    (同 endpoint 无意义);``"dsh"`` → DSH headless(``call_dsh``,prompt 内嵌 schema +
+    jsonschema 校验,不回退);``"opencode"`` → ``opencode run --standalone``
+    (``call_opencode``,结构性禁工具的自定义判官 agent + 隔离 XDG,模型随 opencode
+    config 走,prompt 内嵌 schema + jsonschema 校验,不回退)。
     默认传输为 ``"cc"``。``on_progress``(可选,http 路内部用):
     截断升档重试 / cc 回退前各报一行进度——判官批与 suggest 单发 40-600s,升档三连时终端
     会静默数分钟,报行让看终端的人知道它在动;不传则零输出(历史行为)。
@@ -575,6 +757,15 @@ def call_claude(
             on_progress=on_progress,
             config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
         )
+    if transport == "opencode":
+        # 判官补全经 opencode(模型随 opencode config 走);max_turns/max_tokens 无 CLI
+        # 对等(不透传,与 dsh 分支同型 —— opencode 侧结构禁工具后单步直答即终态)。
+        return call_opencode(
+            prompt=prompt,
+            config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
+            on_usage=on_usage,
+            on_progress=on_progress,
+        )
     if transport == "http":
         try:
             return call_http(
@@ -586,11 +777,23 @@ def call_claude(
             )
         except (HttpThrottled, HttpNoToolUse):
             # 529(过载/身份限流)/ forced tool_use 拿不到 tool_use 块(GLM 只回 thinking /
-            # thinking 撑满 max_tokens)→ 回退 cc:cc 多轮 tool_use 循环催出 + 降级文本兜底,
-            # 绕过 http 单次 forced 的结构死结。其它错(4xx/timeout→RuntimeError)不回退——
-            # 同 endpoint 回退无意义。回退也报一行(否则 http 升档三连耗尽后终端又静默几分钟
-            # 换 cc 磨,前后连起来像整个挂死)。
-            _emit_progress(on_progress, "  ↳ http 通道拿不到结果,回退 cc…")
+            # thinking 撑满 max_tokens)→ 回退 CLI 通道:cc 多轮 tool_use 循环催出 + 降级
+            # 文本兜底,绕过 http 单次 forced 的结构死结。其它错(4xx/timeout→RuntimeError)
+            # 不回退——同 endpoint 回退无意义。
+            # 回退目标查兜底表(与 resolve 同一张):cc 缺位时转 opencode —— 判官批的救命
+            # 支线不能在无 claude 的机器上悄悄变死路。回退也报一行(否则 http 升档三连
+            # 耗尽后终端又静默几分钟换引擎磨,前后连起来像整个挂死)。
+            target = _transport_fallback_for("cc")
+            if target != "cc":
+                _announce_transport_fallback("cc", target)
+            _emit_progress(on_progress, f"  ↳ http 通道拿不到结果,回退 {target}…")
+            if target == "opencode":
+                return call_opencode(
+                    prompt=prompt,
+                    config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
+                    on_usage=on_usage,
+                    on_progress=on_progress,
+                )
             return call_cli(
                 prompt=prompt,
                 max_turns=max_turns,
